@@ -9,31 +9,38 @@ engine, without a separate ETL/reindex pipeline.
 Sub-millisecond hybrid vector + structured-filter queries on live-writing
 data, benchmarked head-to-head against pgvector and Milvus.
 
-## Status: Phase 0 — Setup & Baseline
+## Status: Phase 1 — Storage Engine Core (complete)
 
-This phase proves the durability foundation everything else is built on:
+Phase 0 proved durability (WAL + memtable + crash recovery). Phase 1
+adds the actual LSM behavior on top:
 
-- **WAL** (`src/wal.rs`) — length-prefixed, CRC32-checksummed frames.
-  Every write is fsync'd before it's acknowledged. Replay stops cleanly
-  at a torn tail frame (the expected shape of a mid-write crash) rather
-  than erroring the whole log.
-- **MemTable** (`src/memtable.rs`) — in-memory sorted (`BTreeMap`) write
-  buffer. Last-writer-wins by sequence number, so a replay can never
-  regress a newer write with a stale one. Deletes are tombstone writes,
-  LSM-style.
-- **Engine** (`src/engine.rs`) — ties the two together: `put`/`delete`
-  write WAL-first, then memtable; `open` replays the WAL to reconstruct
-  state after a crash or restart.
+- **SSTable** (`src/sstable.rs`) — immutable, sorted, on-disk table.
+  Physically splits each record into a **row-oriented metadata blob**
+  and a **columnar vector blob** (contiguous f32 arrays), linked by an
+  index sorted by record id. Written via write-to-temp-then-rename, so
+  a crash mid-write never leaves a partial file for a reader to trip
+  over. 6 tests cover roundtrip correctness, tombstone survival, sort
+  order, missing keys, corrupted magic bytes, and empty vectors/metadata.
+- **Engine** (`src/engine.rs`) — now manages a directory (`wal.log` +
+  `NNNNNN.sst` files) instead of a single WAL file. Memtable flushes to
+  a new SSTable once it crosses a threshold (or on explicit `flush()`);
+  reads check memtable first, then SSTables newest-to-oldest, stopping
+  at the first match (a tombstone match means "definitely deleted," not
+  "keep looking" — this is what makes deletes survive across a flush).
+  9 tests cover flush mechanics, multi-SSTable reads, shadowing
+  (newer write/delete overriding an older flushed value), restart
+  recovery post-flush, and — the Phase 1 checkpoint's explicit bar —
+  **100,000 records inserted, flushed across 10+ SSTables, and read
+  back correctly** (including at SSTable boundaries).
 
-Run `cargo test` — 10 tests cover the write path, delete/tombstone
-semantics, out-of-order write handling, and two crash scenarios
-(corrupted frame, torn tail write).
+Run `cargo test --release` — 22 tests total (Phase 0 + Phase 1),
+~70s including the 100K-record scale test.
 
-Run the demo twice against the same path to see recovery firsthand:
+Run the demo twice to see SSTable-based recovery (not just WAL replay):
 
 ```bash
-cargo run -- ./data/neurastore.wal   # inserts seed records
-cargo run -- ./data/neurastore.wal   # "restart" — recovers them from the WAL
+cargo run -- ./data   # inserts 3 records, flushes to 000001.sst
+cargo run -- ./data   # "restart" -- recovers from the SSTable, wal.log is empty
 ```
 
 ## Roadmap
@@ -41,7 +48,7 @@ cargo run -- ./data/neurastore.wal   # "restart" — recovers them from the WAL
 | Phase | Focus | Status |
 |---|---|---|
 | 0 | Setup & baseline — WAL, memtable, crash recovery + pgvector/Milvus baseline numbers | ✅ complete — see `bench/README.md` for full results |
-| 1 | Storage engine core — LSM flush to SSTables, hybrid row/columnar layout | ⬜ |
+| 1 | Storage engine core — LSM flush to SSTables, hybrid row/columnar layout | ✅ complete — 22 tests passing, 100K-record scale test passing |
 | 2 | Static vector index — HNSW on a fixed corpus, recall/latency vs. baselines | ⬜ |
 | 3 | **Incremental/streaming HNSW** — inserts into the graph without full rebuild, concurrent reads during writes. *The core wedge.* | ⬜ |
 | 4 | Query fusion — push structured filters into HNSW traversal instead of overfetch-then-filter. **Target: match pgvector's ~2.8ms unfiltered p50 while keeping Milvus's ~1.1x (near-zero) filter tax instead of pgvector's ~2.6x.** | ⬜ |

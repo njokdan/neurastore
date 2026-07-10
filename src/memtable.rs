@@ -45,10 +45,26 @@ impl MemTable {
         self.inner.get(&id).filter(|r| !r.deleted)
     }
 
+    /// Get the raw slot regardless of tombstone status. The engine needs
+    /// this to distinguish "not in the memtable, keep checking older
+    /// SSTables" from "deleted here, definitely absent" -- `get()` alone
+    /// collapses both cases to None and loses that distinction.
+    pub fn get_raw(&self, id: RecordId) -> Option<&Record> {
+        self.inner.get(&id)
+    }
+
     /// Iterate all live records in key order. Used by Phase 1's flush
     /// path and by brute-force scans until the vector index exists.
     pub fn iter_live(&self) -> impl Iterator<Item = &Record> {
         self.inner.values().filter(|r| !r.deleted)
+    }
+
+    /// Iterate every record including tombstones, in key order. This is
+    /// what flush-to-SSTable must use -- tombstones have to be written
+    /// out too, or a delete would "resurrect" once the memtable that
+    /// recorded it is cleared and only older SSTables remain.
+    pub fn iter_all(&self) -> impl Iterator<Item = &Record> {
+        self.inner.values()
     }
 
     pub fn len(&self) -> usize {
@@ -61,6 +77,14 @@ impl MemTable {
 
     pub fn approx_size_bytes(&self) -> usize {
         self.approx_bytes
+    }
+
+    /// Empty the memtable. Called after a successful flush to an
+    /// SSTable -- the data now lives durably on disk, so the in-memory
+    /// copy (and the WAL bytes behind it) can be dropped.
+    pub fn clear(&mut self) {
+        self.inner.clear();
+        self.approx_bytes = 0;
     }
 
     fn estimate_size(record: &Record) -> usize {
