@@ -66,6 +66,22 @@ Each prints:
   overfetch-then-filter number NeuraStore's Phase 4 query fusion is
   trying to beat
 
+## 4.5. Run NeuraStore's own benchmark (Phase 2+)
+
+```bash
+cd ..   # back to the neurastore/ repo root
+cargo run --release --bin bench_neurastore -- bench/data/siftsmall 10 40
+```
+
+Same metrics, same format, same dataset — so all three engines' numbers
+land in one table. One expected asymmetry worth knowing going in:
+NeuraStore's query latency will likely look dramatically lower than
+pgvector/Milvus's — that's not (yet) an apples-to-apples storage-engine
+comparison, it's partly because this binary calls the engine in-process
+(a plain function call), while pgvector and Milvus are benchmarked over
+a real client connection (SQL/gRPC round-trip). Worth normalizing for
+that difference in any writeup rather than presenting it as a raw win.
+
 ## 5. What to send back
 
 Paste me the console output from both scripts (or a screenshot). That
@@ -117,6 +133,48 @@ are fine for testing harness *mechanics*, but not valid for benchmarking
 data) for that. siftsmall's 100 real queries, run 3x with randomized
 order and warm-up, was judged sufficient and more trustworthy than a
 larger but structurally invalid synthetic sample.
+
+## Phase 2 Results (final, post batch-write fix)
+
+Measured on siftsmall (10,000 base vectors, dim=128, 100 queries), via
+`bin/bench_neurastore`, after fixing the insert-throughput regression
+described below.
+
+| Metric | pgvector | Milvus | NeuraStore |
+|---|---|---|---|
+| Insert throughput (vec/sec) | ~1,633 | ~2,545 | **11,355** |
+| Unfiltered query p50 | ~2.81ms | ~5.99ms | **0.36ms** |
+| Recall@10 | ~0.984 | ~0.988 | **0.983** |
+
+### Recall: genuinely competitive
+
+0.983 vs. 0.984 (pgvector) and 0.988 (Milvus) — the from-scratch HNSW
+implementation is finding true nearest neighbors at essentially the same
+rate as two mature, widely-used systems. This is the real validation
+Phase 2 was aiming for.
+
+### Insert throughput: now a genuine, defensible lead
+
+Initial numbers (1,106 vec/sec) were the *slowest* of the three, traced
+to `Engine::put()` doing a synchronous fsync per record. Fixed with
+`Engine::put_batch()` / `Wal::append_batch()` — one fsync per batch
+instead of per record (`src/wal.rs` documents the durability tradeoff:
+all-or-nothing per batch on a crash, not per-record — the right
+tradeoff for a bulk load, not the default for interactive single writes,
+which still use `put()`). Result: **11,355 vec/sec, ~4.5–7x faster than
+both baselines** — measured on the real corpus, not just a synthetic
+smoke test. This is the one number in the table that's a clean,
+unqualified win.
+
+### Latency: still not a fair comparison, still don't read it as a win
+
+0.36ms looks dramatically faster, but this benchmark calls the engine
+in-process (a plain Rust function call). pgvector and Milvus are
+benchmarked over a real client connection (SQL / gRPC round-trip) — a
+cost NeuraStore hasn't had to pay yet because it doesn't have a
+network-facing API. This becomes a meaningful, comparable number once
+Phase 5 adds one and this benchmark is redone client-to-server like the
+other two.
 
 
 

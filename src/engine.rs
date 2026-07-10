@@ -12,6 +12,8 @@
 use crate::memtable::MemTable;
 use crate::record::{Record, RecordId};
 use crate::sstable::{self, SSTableError, SSTableReader};
+use crate::vector_index::VectorIndex;
+use crate::hnsw::HnswParams;
 use crate::wal::{Wal, WalError};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -44,6 +46,11 @@ pub struct Engine {
     next_sstable_id: u64,
     seq: AtomicU64,
     flush_threshold: usize,
+    /// Phase 2: static vector index, built on demand via `build_index()`
+    /// from a snapshot of `scan_live()`. None until the first call, and
+    /// silently stale after further writes until rebuilt -- Phase 3
+    /// replaces this with an index that updates incrementally instead.
+    vector_index: Option<VectorIndex>,
 }
 
 impl Engine {
@@ -101,6 +108,7 @@ impl Engine {
             next_sstable_id,
             seq: AtomicU64::new(max_seq),
             flush_threshold: DEFAULT_FLUSH_THRESHOLD,
+            vector_index: None,
         })
     }
 
@@ -123,6 +131,30 @@ impl Engine {
         let record = Record::new(id, vector, metadata, self.next_seq());
         self.wal.append(&record)?;
         self.memtable.insert(record);
+        self.maybe_flush()?;
+        Ok(())
+    }
+
+    /// Insert many records with a single WAL fsync for the whole batch,
+    /// instead of one per record. Meant for bulk loads (initial data
+    /// import, `bin/bench_neurastore`, batch APIs) where the caller
+    /// already treats the whole set as one logical unit of work -- see
+    /// `Wal::append_batch`'s docs for the durability tradeoff this makes
+    /// (all-or-nothing on a crash mid-batch, not per-record). For
+    /// interactive single writes where each one needs its own durability
+    /// guarantee the instant it returns, use `put` instead.
+    pub fn put_batch(
+        &mut self,
+        entries: Vec<(RecordId, Vec<f32>, HashMap<String, String>)>,
+    ) -> Result<(), EngineError> {
+        let records: Vec<Record> = entries
+            .into_iter()
+            .map(|(id, vector, metadata)| Record::new(id, vector, metadata, self.next_seq()))
+            .collect();
+        self.wal.append_batch(&records)?;
+        for record in records {
+            self.memtable.insert(record);
+        }
         self.maybe_flush()?;
         Ok(())
     }
@@ -188,6 +220,35 @@ impl Engine {
 
     pub fn sstable_count(&self) -> usize {
         self.sstables.len()
+    }
+
+    /// Build (or rebuild) the vector index from a fresh snapshot of all
+    /// live records. Phase 2 is deliberately explicit about this instead
+    /// of auto-rebuilding on every write -- that would make writes pay
+    /// an unpredictable, corpus-size-dependent cost. Call this once
+    /// after loading/writing a batch, before querying.
+    pub fn build_index(&mut self) {
+        self.build_index_with_params(HnswParams::default(), 42);
+    }
+
+    pub fn build_index_with_params(&mut self, params: HnswParams, seed: u64) {
+        let records = self.scan_live();
+        self.vector_index = Some(VectorIndex::build(&records, params, seed));
+    }
+
+    pub fn has_index(&self) -> bool {
+        self.vector_index.is_some()
+    }
+
+    pub fn index_len(&self) -> Option<usize> {
+        self.vector_index.as_ref().map(|idx| idx.len())
+    }
+
+    /// Approximate k-nearest-neighbor search against the built index.
+    /// Returns `None` if `build_index()` hasn't been called yet --
+    /// callers should treat that as "index not ready," not "no results."
+    pub fn search_knn(&self, query: &[f32], k: usize, ef_search: usize) -> Option<Vec<(RecordId, f32)>> {
+        self.vector_index.as_ref().map(|idx| idx.search(query, k, ef_search))
     }
 
     fn maybe_flush(&mut self) -> Result<(), EngineError> {
@@ -353,6 +414,53 @@ mod tests {
         assert_eq!(engine.sstable_count(), 1);
         assert_eq!(engine.memtable_len(), 0);
         assert_eq!(engine.len(), 3);
+    }
+
+    #[test]
+    fn put_batch_inserts_all_records_and_recovers_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut engine = Engine::open(dir.path()).unwrap();
+            let entries: Vec<(RecordId, Vec<f32>, HashMap<String, String>)> = (1..=200)
+                .map(|i| (i, vec![i as f32], HashMap::new()))
+                .collect();
+            engine.put_batch(entries).unwrap();
+            assert_eq!(engine.len(), 200);
+        }
+        // Restart -- batch must have been fsync'd durably, same as
+        // individual puts, just with one fsync instead of 200.
+        let engine = Engine::open(dir.path()).unwrap();
+        assert_eq!(engine.len(), 200);
+        assert_eq!(engine.get(100).unwrap().vector, vec![100.0]);
+    }
+
+    #[test]
+    fn put_batch_is_meaningfully_faster_than_individual_puts() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let individual_start = std::time::Instant::now();
+        {
+            let mut engine = Engine::open(dir.path().join("individual")).unwrap();
+            for i in 1..=300u64 {
+                engine.put(i, vec![i as f32], HashMap::new()).unwrap();
+            }
+        }
+        let individual_elapsed = individual_start.elapsed();
+
+        let batch_start = std::time::Instant::now();
+        {
+            let mut engine = Engine::open(dir.path().join("batch")).unwrap();
+            let entries: Vec<(RecordId, Vec<f32>, HashMap<String, String>)> =
+                (1..=300).map(|i| (i, vec![i as f32], HashMap::new())).collect();
+            engine.put_batch(entries).unwrap();
+        }
+        let batch_elapsed = batch_start.elapsed();
+
+        assert!(
+            batch_elapsed < individual_elapsed,
+            "expected put_batch ({batch_elapsed:?}) to meaningfully beat {} individual puts ({individual_elapsed:?})",
+            300
+        );
     }
 
     #[test]

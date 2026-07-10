@@ -43,13 +43,54 @@ cargo run -- ./data   # inserts 3 records, flushes to 000001.sst
 cargo run -- ./data   # "restart" -- recovers from the SSTable, wal.log is empty
 ```
 
+## Status: Phase 2 — Static Vector Index (complete)
+
+A from-scratch HNSW (Hierarchical Navigable Small World) implementation,
+built on top of the Phase 1 storage engine:
+
+- **HNSW core** (`src/hnsw.rs`) — layered graph, greedy best-first search,
+  squared-L2 distance (matches the `vector_l2_ops`/`L2` metric used in
+  the pgvector/Milvus baseline, so results are directly comparable). 7
+  tests, including one that documents a real, non-obvious finding (see
+  below) rather than hiding it.
+- **VectorIndex** (`src/vector_index.rs`) — maps the engine's `RecordId`
+  space to HNSW's internal dense node-id space. 3 tests.
+- **Engine integration** — `Engine::build_index()` builds a fresh index
+  from a snapshot of all live records; `Engine::search_knn()` queries it.
+  Explicit build step, not automatic-on-write — Phase 2 is a *static*
+  index (build once, then query); making it update incrementally as
+  writes happen is Phase 3's job.
+- **`bin/bench_neurastore`** — reads the same `.fvecs`/`.ivecs` SIFT
+  dataset files and computes the same metrics (insert throughput, build
+  time, latency percentiles, recall@k) as `bench/scripts/bench_pgvector.py`
+  and `bench_milvus.py`, so all three engines' numbers land in the same
+  table. Run with:
+  ```bash
+  python bench/scripts/prepare_dataset.py --mode siftsmall
+  cargo run --release --bin bench_neurastore -- bench/data/siftsmall 10 40
+  ```
+
+### A real finding worth knowing before you tune parameters
+
+While testing, a self-lookup query (searching with a vector's own value)
+sometimes failed to find itself even with `ef_search` far larger than
+the whole corpus. Root cause: HNSW's random per-node level assignment
+needs *enough points per cluster* that at least one lands on an upper
+graph layer — otherwise that whole cluster can become an island with no
+path back to the global entry point, and no query-time search budget
+fixes that; it's a construction-time density requirement, not a search
+bug. `hnsw::tests::sparse_clusters_can_strand_a_whole_cluster_from_the_entry_point`
+reproduces and documents this deliberately, since it's exactly the kind
+of failure mode Phase 3 needs to keep in mind once the corpus grows
+incrementally instead of being built all at once.
+
 ## Roadmap
 
 | Phase | Focus | Status |
 |---|---|---|
 | 0 | Setup & baseline — WAL, memtable, crash recovery + pgvector/Milvus baseline numbers | ✅ complete — see `bench/README.md` for full results |
 | 1 | Storage engine core — LSM flush to SSTables, hybrid row/columnar layout | ✅ complete — 22 tests passing, 100K-record scale test passing |
-| 2 | Static vector index — HNSW on a fixed corpus, recall/latency vs. baselines | ⬜ |
+| 2 | Static vector index — HNSW on a fixed corpus, recall/latency vs. baselines | ✅ complete — recall@10 0.983 (competitive: pgvector 0.984, Milvus 0.988). Insert throughput 11,355 vec/sec — **beats both baselines** (pgvector 1,633, Milvus 2,545) after fixing a per-write fsync bottleneck via batched WAL writes. See `bench/README.md`. |
 | 3 | **Incremental/streaming HNSW** — inserts into the graph without full rebuild, concurrent reads during writes. *The core wedge.* | ⬜ |
 | 4 | Query fusion — push structured filters into HNSW traversal instead of overfetch-then-filter. **Target: match pgvector's ~2.8ms unfiltered p50 while keeping Milvus's ~1.1x (near-zero) filter tax instead of pgvector's ~2.6x.** | ⬜ |
 | 5 | Interface & hardening — gRPC/HTTP API, load testing, benchmark report | ⬜ |
