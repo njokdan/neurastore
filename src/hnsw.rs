@@ -103,7 +103,20 @@ struct Node {
 
 pub struct HnswIndex {
     params: HnswParams,
-    vectors: Vec<Vec<f32>>,
+    /// All vectors stored contiguously, one after another: vector for
+    /// internal id `i` lives at `vectors[i*dim..(i+1)*dim]`. This
+    /// replaced a `Vec<Vec<f32>>` (one heap allocation per vector) --
+    /// real benchmarking (bench/README.md's Phase 4 section) showed
+    /// filtered search spending real time on cache-unfriendly, scattered
+    /// memory access when scanning many candidates for a brute-force
+    /// distance computation. A flat layout means scanning candidates
+    /// walks contiguous memory instead of chasing pointers -- this is
+    /// also what the original architecture doc's "hybrid row/columnar
+    /// layout" called for, previously only implemented for on-disk
+    /// SSTables (`sstable.rs`), not this in-memory structure.
+    vectors: Vec<f32>,
+    dim: usize,
+    count: usize,
     nodes: Vec<Node>,
     entry_point: Option<usize>,
     max_level: usize,
@@ -116,6 +129,8 @@ impl HnswIndex {
         Self {
             params,
             vectors: Vec::new(),
+            dim: 0,
+            count: 0,
             nodes: Vec::new(),
             entry_point: None,
             max_level: 0,
@@ -124,11 +139,21 @@ impl HnswIndex {
     }
 
     pub fn len(&self) -> usize {
-        self.vectors.len()
+        self.count
     }
 
     pub fn is_empty(&self) -> bool {
-        self.vectors.is_empty()
+        self.count == 0
+    }
+
+    /// Read access to a node's raw vector by internal id. Used by
+    /// `VectorIndex`'s brute-force fallback path for highly selective
+    /// filtered queries (Phase 4) -- cheaper to compute exact distances
+    /// against a small candidate set directly than to run a graph search
+    /// for a handful of matches.
+    pub fn vector(&self, internal_id: usize) -> &[f32] {
+        let start = internal_id * self.dim;
+        &self.vectors[start..start + self.dim]
     }
 
     fn random_level(&self, rng: &mut impl Rng) -> usize {
@@ -140,9 +165,18 @@ impl HnswIndex {
     /// lifetime of this index -- callers map their own external ids to
     /// this via `VectorIndex`, not this layer).
     pub fn insert(&mut self, vector: Vec<f32>, rng: &mut impl Rng) -> usize {
-        let new_id = self.vectors.len();
+        let new_id = self.count;
         let level = self.random_level(rng);
-        self.vectors.push(vector);
+        if self.dim == 0 {
+            self.dim = vector.len();
+        }
+        debug_assert_eq!(
+            vector.len(),
+            self.dim,
+            "HnswIndex::insert called with mismatched dimension -- callers (VectorIndex) must enforce this"
+        );
+        self.vectors.extend_from_slice(&vector);
+        self.count += 1;
         self.nodes.push(Node { neighbors: vec![Vec::new(); level + 1] });
 
         let Some(entry) = self.entry_point else {
@@ -151,7 +185,7 @@ impl HnswIndex {
             return new_id;
         };
 
-        let query = self.vectors[new_id].clone();
+        let query = self.vector(new_id).to_vec();
         let query = query.as_slice();
         let mut cur = entry;
 
@@ -160,14 +194,14 @@ impl HnswIndex {
         // (ef=1) -- this finds a good entry point for the layers where
         // we'll actually do a full search-and-connect below.
         for lc in (level + 1..=self.max_level).rev() {
-            cur = self.search_layer(query, cur, lc, 1)[0].id;
+            cur = self.search_layer(query, cur, lc, 1, None, self.count)[0].id;
         }
 
         // For every layer the new node actually lives on, search with
         // ef_construction candidates, connect to the best `m` of them,
         // and prune each neighbor's list so it doesn't grow unbounded.
         for lc in (0..=level.min(self.max_level)).rev() {
-            let candidates = self.search_layer(query, cur, lc, self.params.ef_construction);
+            let candidates = self.search_layer(query, cur, lc, self.params.ef_construction, None, self.count);
             let m_layer = if lc == 0 { self.params.m_max0 } else { self.params.m };
             let chosen: Vec<usize> = candidates.iter().take(m_layer).map(|c| c.id).collect();
 
@@ -189,7 +223,13 @@ impl HnswIndex {
     }
 
     fn connect_and_prune(&mut self, node_id: usize, new_neighbor: usize, layer: usize, m_max: usize) {
-        let neighbors = &mut self.nodes[node_id].neighbors[layer];
+        // Clone the neighbor list out first and release the mutable
+        // borrow immediately -- `self.vector()` needs an immutable
+        // borrow of `self` below, and a method call (unlike direct field
+        // access) doesn't let the borrow checker see that `vectors` and
+        // `nodes` are disjoint fields, so the mutable borrow of
+        // `self.nodes[...]` can't stay alive across those calls.
+        let mut neighbors: Vec<usize> = self.nodes[node_id].neighbors[layer].clone();
         if !neighbors.contains(&new_neighbor) {
             neighbors.push(new_neighbor);
         }
@@ -200,33 +240,71 @@ impl HnswIndex {
             // closest-m is the simpler variant and Phase 2's correctness
             // bar -- swapping in the diversity heuristic is a reasonable
             // later optimization, not a correctness requirement.)
-            let node_vec = self.vectors[node_id].clone();
+            let node_vec = self.vector(node_id).to_vec();
             let mut scored: Vec<(usize, f32)> = neighbors
                 .iter()
-                .map(|&id| (id, squared_l2(&node_vec, &self.vectors[id])))
+                .map(|&id| (id, squared_l2(&node_vec, self.vector(id))))
                 .collect();
             scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
             scored.truncate(m_max);
-            *neighbors = scored.into_iter().map(|(id, _)| id).collect();
+            neighbors = scored.into_iter().map(|(id, _)| id).collect();
         }
+        self.nodes[node_id].neighbors[layer] = neighbors;
     }
 
     /// Greedy best-first search within a single layer. Returns up to
     /// `ef` candidates, sorted closest-first.
-    fn search_layer(&self, query: &[f32], entry: usize, layer: usize, ef: usize) -> Vec<Candidate> {
+    ///
+    /// `filter`, when present, is the mechanism that actually avoids the
+    /// overfetch-then-filter tax pgvector pays (see bench/README.md's
+    /// Phase 0 baseline): the graph is still traversed through
+    /// *non-matching* nodes (their neighbors might lead to matching
+    /// ones -- a matching node reached only through a non-matching
+    /// "bridge" node must still be findable), but only *matching* nodes
+    /// count toward `results` and the `ef`-sized stopping budget. That
+    /// means a highly selective filter naturally makes the search dig
+    /// deeper into the graph instead of returning a mostly-empty result
+    /// early -- the predicate is part of the search itself, not a
+    /// discard step applied after.
+    ///
+    /// `max_visits` bounds the worst case (a filter matching zero or
+    /// almost nothing in the whole graph): without a cap, search would
+    /// silently degrade into a full graph traversal. This is the same
+    /// "heuristic, not a hard guarantee" tradeoff already documented for
+    /// tombstone filtering in `vector_index.rs`.
+    fn search_layer(
+        &self,
+        query: &[f32],
+        entry: usize,
+        layer: usize,
+        ef: usize,
+        filter: Option<&dyn Fn(usize) -> bool>,
+        max_visits: usize,
+    ) -> Vec<Candidate> {
+        let matches = |id: usize| filter.map(|f| f(id)).unwrap_or(true);
+
         let mut visited: HashSet<usize> = HashSet::new();
         visited.insert(entry);
 
-        let entry_dist = squared_l2(query, &self.vectors[entry]);
+        let entry_dist = squared_l2(query, self.vector(entry));
         let mut candidates: BinaryHeap<MinCandidate> =
             BinaryHeap::from([MinCandidate(Candidate { dist: entry_dist, id: entry })]);
-        let mut results: BinaryHeap<Candidate> =
-            BinaryHeap::from([Candidate { dist: entry_dist, id: entry }]);
+        let mut results: BinaryHeap<Candidate> = BinaryHeap::new();
+        if matches(entry) {
+            results.push(Candidate { dist: entry_dist, id: entry });
+        }
 
         while let Some(MinCandidate(current)) = candidates.pop() {
+            if visited.len() > max_visits {
+                break;
+            }
             // Stop once the closest remaining candidate is farther than
-            // our worst kept result and we already have enough results --
-            // nothing left in the frontier can improve the answer.
+            // our worst kept result and we already have enough MATCHING
+            // results -- nothing left in the frontier can improve the
+            // answer. Note this only fires once `results` (matching
+            // nodes only) reaches `ef`, so a selective filter correctly
+            // keeps the search going past where an unfiltered search
+            // would have stopped.
             if let Some(worst) = results.peek() {
                 if current.dist > worst.dist && results.len() >= ef {
                     break;
@@ -238,13 +316,20 @@ impl HnswIndex {
             }
             for &neighbor_id in &self.nodes[current.id].neighbors[layer] {
                 if visited.insert(neighbor_id) {
-                    let dist = squared_l2(query, &self.vectors[neighbor_id]);
-                    let worst = results.peek().map(|c| c.dist);
-                    if results.len() < ef || worst.map(|w| dist < w).unwrap_or(true) {
-                        candidates.push(MinCandidate(Candidate { dist, id: neighbor_id }));
-                        results.push(Candidate { dist, id: neighbor_id });
-                        if results.len() > ef {
-                            results.pop();
+                    let dist = squared_l2(query, self.vector(neighbor_id));
+                    // Always explore through the neighbor (push to the
+                    // frontier) regardless of whether it matches --
+                    // it may be the only path to a matching node deeper
+                    // in the graph. Only matching neighbors are eligible
+                    // to become part of the answer set.
+                    candidates.push(MinCandidate(Candidate { dist, id: neighbor_id }));
+                    if matches(neighbor_id) {
+                        let worst = results.peek().map(|c| c.dist);
+                        if results.len() < ef || worst.map(|w| dist < w).unwrap_or(true) {
+                            results.push(Candidate { dist, id: neighbor_id });
+                            if results.len() > ef {
+                                results.pop();
+                            }
                         }
                     }
                 }
@@ -263,20 +348,47 @@ impl HnswIndex {
         let Some(entry) = self.entry_point else { return Vec::new() };
         let mut cur = entry;
         for lc in (1..=self.max_level).rev() {
-            cur = self.search_layer(query, cur, lc, 1)[0].id;
+            cur = self.search_layer(query, cur, lc, 1, None, self.len())[0].id;
         }
-        let candidates = self.search_layer(query, cur, 0, ef_search.max(k));
+        let candidates = self.search_layer(query, cur, 0, ef_search.max(k), None, self.len());
+        candidates.into_iter().take(k).map(|c| (c.id, c.dist)).collect()
+    }
+
+    /// Approximate k-nearest-neighbor search restricted to nodes where
+    /// `filter(internal_id)` returns true -- the predicate is pushed
+    /// into the graph traversal itself (see `search_layer`'s docs), not
+    /// applied after fetching an unfiltered top-k. `max_visits` bounds
+    /// the cost of a highly selective (or impossible) filter; a sensible
+    /// default is the graph's total size, capped lower if latency matters
+    /// more than exhaustiveness for very selective filters.
+    pub fn search_filtered(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        filter: &dyn Fn(usize) -> bool,
+        max_visits: usize,
+    ) -> Vec<(usize, f32)> {
+        let Some(entry) = self.entry_point else { return Vec::new() };
+        let mut cur = entry;
+        // Upper-layer descent stays unfiltered -- it's coarse navigation
+        // toward the right neighborhood, not answer selection, so there's
+        // no benefit to restricting it (and doing so could strand the
+        // descent if the filter happens to exclude every node at a
+        // sparse upper layer -- see the cluster-stranding finding in
+        // Phase 2 for why sparse upper layers are already a delicate area).
+        for lc in (1..=self.max_level).rev() {
+            cur = self.search_layer(query, cur, lc, 1, None, self.len())[0].id;
+        }
+        let candidates = self.search_layer(query, cur, 0, ef_search.max(k), Some(filter), max_visits);
         candidates.into_iter().take(k).map(|c| (c.id, c.dist)).collect()
     }
 
     /// Exact brute-force k-NN, for correctness/recall testing against
     /// the approximate `search` above. O(n) per query -- reference only.
     pub fn brute_force(&self, query: &[f32], k: usize) -> Vec<(usize, f32)> {
-        let mut scored: Vec<(usize, f32)> = self
-            .vectors
-            .iter()
-            .enumerate()
-            .map(|(id, v)| (id, squared_l2(query, v)))
+        let mut scored: Vec<(usize, f32)> = (0..self.count)
+            .map(|id| (id, squared_l2(query, self.vector(id))))
             .collect();
         scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
         scored.truncate(k);

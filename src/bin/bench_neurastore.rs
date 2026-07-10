@@ -13,6 +13,13 @@
 //! incremental_growth_matches_batch_build_recall`, which proves the same
 //! claim on synthetic clustered data.
 //!
+//! And a Phase 4 check: measures the "filter tax" (filtered vs.
+//! unfiltered query latency, `WHERE category=X`) using the same
+//! randomized-order + warm-up methodology as `bench_pgvector.py` /
+//! `bench_milvus.py`, so the number is directly comparable to the
+//! Phase 0 baseline (pgvector ~2.6x, Milvus ~1.1x) instead of being
+//! measured under different conditions.
+//!
 //! Usage (after `python bench/scripts/prepare_dataset.py --mode siftsmall`
 //! has downloaded and extracted the corpus on the machine running this):
 //!
@@ -97,6 +104,14 @@ fn main() {
     let data_dir = args.get(1).cloned().unwrap_or_else(|| "bench/data/siftsmall".to_string());
     let k: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
     let ef_search: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(40);
+    // Number of distinct filter values (categories). Default 4 matches
+    // bench_pgvector.py / bench_milvus.py exactly, for direct comparison.
+    // A higher value simulates a more selective, more realistic filter
+    // (e.g. --cardinality 100 means each filter matches ~1% of the
+    // corpus instead of ~25%) -- useful for checking whether the filter
+    // tax is a selectivity artifact rather than a fixed cost. See
+    // bench/README.md's Phase 4 section for why this matters.
+    let cardinality: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(4);
 
     let dir = Path::new(&data_dir);
     let base_path = dir.join("siftsmall_base.fvecs");
@@ -117,11 +132,12 @@ fn main() {
     let ground_truth = read_ivecs(&gt_path);
     let dim = base[0].len();
     println!("Dataset: {} base vectors, dim={dim}, {} queries", base.len(), queries.len());
+    println!("Filter cardinality: {cardinality} categories (~{:.1}% selectivity per filter)", 100.0 / cardinality as f64);
 
     // Categories synthesized the same way bench_pgvector.py / bench_milvus.py
-    // do -- texmex has no metadata, so this exists purely to let a future
-    // filtered-query benchmark run against the same corpus (Phase 4).
-    let categories = ["docs", "code", "chat", "logs"];
+    // do -- texmex has no metadata, so this exists purely to enable
+    // filtered-query benchmarking against the same corpus (Phase 4).
+    let categories: Vec<String> = (0..cardinality).map(|i| format!("cat{i}")).collect();
 
     // Split the corpus: build the index from the first 80%, hold back
     // the last 20% to stream in AFTER build_index() -- proving the
@@ -140,7 +156,7 @@ fn main() {
         .iter()
         .enumerate()
         .map(|(i, vector)| {
-            let category = categories[i % categories.len()];
+            let category = &categories[i % categories.len()];
             (i as u64, vector.clone(), HashMap::from([("category".to_string(), category.to_string())]))
         })
         .collect();
@@ -188,7 +204,7 @@ fn main() {
     let mut stream_latencies = Vec::with_capacity(streamed.len());
     for (offset, vector) in streamed.iter().enumerate() {
         let id = (split + offset) as u64;
-        let category = categories[id as usize % categories.len()];
+        let category = &categories[id as usize % categories.len()];
         let t0 = Instant::now();
         engine
             .put(id, vector.clone(), HashMap::from([("category".to_string(), category.to_string())]))
@@ -214,6 +230,74 @@ fn main() {
         println!("OK: recall did not degrade after incremental growth without a rebuild.");
     } else {
         println!("WARNING: recall dropped after incremental growth -- investigate before trusting this index shape for production use.");
+    }
+
+    // --- Phase 4: filter tax, measured the same way as the pgvector/
+    // Milvus baseline (bench_pgvector.py / bench_milvus.py) -- randomized
+    // order between filtered/unfiltered, warm-up before each, so this is
+    // a genuinely apples-to-apples comparison to bench/README.md's
+    // Phase 0 numbers (pgvector ~2.6x tax, Milvus ~1.1x tax), not just
+    // two numbers computed under different conditions.
+    println!("\n--- Phase 4: filter tax (WHERE category=X), full corpus ---");
+
+    let run_unfiltered = |engine: &Engine| -> Vec<f64> {
+        let mut latencies = Vec::with_capacity(queries.len());
+        for q in &queries {
+            let start = Instant::now();
+            engine.search_knn(q, k, ef_search);
+            latencies.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        latencies
+    };
+    let run_filtered = |engine: &Engine| -> Vec<f64> {
+        let mut latencies = Vec::with_capacity(queries.len());
+        for (i, q) in queries.iter().enumerate() {
+            let category = &categories[i % categories.len()];
+            let start = Instant::now();
+            engine.search_knn_filtered(q, k, ef_search, "category", &category);
+            latencies.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        latencies
+    };
+
+    // Warm up both paths before measuring either.
+    for q in queries.iter().take(20.min(queries.len())) {
+        engine.search_knn(q, k, ef_search);
+        engine.search_knn_filtered(q, k, ef_search, "category", &categories[0]);
+    }
+
+    let order_flip = std::process::id() % 2 == 0; // simple, dependency-free randomization
+    println!("Running in order: {} (varied per run to rule out ordering bias)", if order_flip { "filtered, unfiltered" } else { "unfiltered, filtered" });
+
+    let (unfiltered_latencies, filtered_latencies) = if order_flip {
+        let f = run_filtered(&engine);
+        let u = run_unfiltered(&engine);
+        (u, f)
+    } else {
+        let u = run_unfiltered(&engine);
+        let f = run_filtered(&engine);
+        (u, f)
+    };
+
+    print_latency_summary("NeuraStore unfiltered query latency (filter-tax comparison)", unfiltered_latencies.clone());
+    print_latency_summary("NeuraStore filtered (category=X) query latency", filtered_latencies.clone());
+
+    let median = |v: &[f64]| -> f64 {
+        let mut s = v.to_vec();
+        s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        percentile(&s, 50.0)
+    };
+    let unfiltered_p50 = median(&unfiltered_latencies);
+    let filtered_p50 = median(&filtered_latencies);
+    let tax = filtered_p50 / unfiltered_p50;
+    println!("\nFilter tax (filtered p50 / unfiltered p50): {tax:.2}x");
+    println!("Baseline comparison -- pgvector: ~2.6x, Milvus: ~1.1x (bench/README.md)");
+    if tax < 1.5 {
+        println!("Target met: filter tax is well below pgvector's overfetch-then-filter penalty.");
+    } else if tax < 2.6 {
+        println!("Better than pgvector's tax, but not yet at Milvus-level near-parity -- room to tune ef_search/thresholds.");
+    } else {
+        println!("Filter tax is not yet beating the baseline -- investigate before claiming this as a win.");
     }
 
     // Clean up the temp engine directory -- this binary is a benchmark

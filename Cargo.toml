@@ -19,6 +19,16 @@ bincode = "1"
 crc32fast = "1"
 thiserror = "1"
 rand = "0.8"
+rayon = "=1.8.1"
+rayon-core = "=1.12.1"
 
 [dev-dependencies]
 tempfile = "=3.10.1"
+
+[profile.release]
+# The hot paths here (squared_l2 distance computation, graph traversal)
+# are exactly what LTO + single-codegen-unit help most: better inlining
+# and vectorization opportunities across module boundaries, at the cost
+# of longer compile times. Worth it for a database engine's core loop.
+lto = true
+codegen-units = 1

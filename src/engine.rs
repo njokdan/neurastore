@@ -149,7 +149,7 @@ impl Engine {
         // already existed there is treated as an update (the insert
         // implicitly clears any prior tombstone -- see vector_index.rs).
         if let Some(index) = &self.vector_index {
-            index.write().expect("vector index lock poisoned").insert(id, &record.vector);
+            index.write().expect("vector index lock poisoned").insert(id, &record.vector, &record.metadata);
         }
         self.memtable.insert(record);
         self.maybe_flush()?;
@@ -179,7 +179,7 @@ impl Engine {
             // principle as the WAL batching fix, applied to the index.
             let mut guard = index.write().expect("vector index lock poisoned");
             for record in &records {
-                guard.insert(record.id, &record.vector);
+                guard.insert(record.id, &record.vector, &record.metadata);
             }
         }
         for record in records {
@@ -296,6 +296,27 @@ impl Engine {
         self.vector_index
             .as_ref()
             .map(|idx| idx.read().expect("vector index lock poisoned").search(query, k, ef_search))
+    }
+
+    /// Phase 4: hybrid vector + structured-filter search -- only records
+    /// where `metadata[field] == value` are eligible. The predicate is
+    /// pushed into the graph traversal (or answered via exact brute
+    /// force for highly selective filters), not applied by discarding an
+    /// unfiltered top-k after fetching it. See `vector_index.rs` for the
+    /// mechanism. Returns `None` if `build_index()` hasn't been called yet.
+    pub fn search_knn_filtered(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        field: &str,
+        value: &str,
+    ) -> Option<Vec<(RecordId, f32)>> {
+        self.vector_index.as_ref().map(|idx| {
+            idx.read()
+                .expect("vector index lock poisoned")
+                .search_filtered(query, k, ef_search, field, value)
+        })
     }
 
     fn maybe_flush(&mut self) -> Result<(), EngineError> {
@@ -607,7 +628,7 @@ mod tests {
             scope.spawn(move || {
                 for i in 200..400u64 {
                     let mut guard = writer_handle.write().expect("write lock should not be poisoned");
-                    guard.insert(i, &[i as f32, (i % 13) as f32]);
+                    guard.insert(i, &[i as f32, (i % 13) as f32], &HashMap::new());
                 }
             });
         });
@@ -648,6 +669,78 @@ mod tests {
 
         assert_eq!(incremental_len, rebuilt_len);
         assert_eq!(rebuilt_len, 148); // 150 inserted - 2 deleted
+    }
+
+    #[test]
+    fn search_knn_filtered_only_returns_matching_category() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::open(dir.path()).unwrap();
+
+        for i in 0..20u64 {
+            let category = if i % 2 == 0 { "docs" } else { "code" };
+            engine
+                .put(i, vec![i as f32, 0.0], HashMap::from([("category".to_string(), category.to_string())]))
+                .unwrap();
+        }
+        engine.build_index();
+
+        let results = engine.search_knn_filtered(&[0.0, 0.0], 5, 50, "category", "docs").unwrap();
+        assert!(!results.is_empty());
+        for (id, _) in &results {
+            assert_eq!(id % 2, 0, "only 'docs' (even ids) should be returned");
+        }
+    }
+
+    #[test]
+    fn search_knn_filtered_stays_correct_after_incremental_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::open(dir.path()).unwrap();
+
+        for i in 0..10u64 {
+            engine
+                .put(i, vec![i as f32, 0.0], HashMap::from([("category".to_string(), "docs".to_string())]))
+                .unwrap();
+        }
+        engine.build_index();
+
+        // Writes after build_index() -- filtered search must see these
+        // without a rebuild, same as unfiltered search already proved in
+        // Phase 3.
+        engine
+            .put(10, vec![10.0, 0.0], HashMap::from([("category".to_string(), "docs".to_string())]))
+            .unwrap();
+        engine
+            .put(11, vec![11.0, 0.0], HashMap::from([("category".to_string(), "code".to_string())]))
+            .unwrap();
+
+        let results = engine.search_knn_filtered(&[10.0, 0.0], 5, 50, "category", "docs").unwrap();
+        let ids: Vec<RecordId> = results.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&10), "record added after build_index() should be findable via filtered search");
+        assert!(!ids.contains(&11), "non-matching record should not appear");
+    }
+
+    #[test]
+    fn search_knn_filtered_update_correctness() {
+        // Direct engine-level check of the Phase 4 bug fix: updating a
+        // record's category must make it stop matching its old filter
+        // and start matching its new one.
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::open(dir.path()).unwrap();
+        engine
+            .put(1, vec![0.0, 0.0], HashMap::from([("category".to_string(), "docs".to_string())]))
+            .unwrap();
+        engine.build_index();
+
+        // Update: same id, different category.
+        engine
+            .put(1, vec![0.0, 0.0], HashMap::from([("category".to_string(), "code".to_string())]))
+            .unwrap();
+
+        let docs_results = engine.search_knn_filtered(&[0.0, 0.0], 5, 50, "category", "docs").unwrap();
+        assert!(docs_results.is_empty(), "id 1 should no longer match 'docs' after being updated to 'code'");
+
+        let code_results = engine.search_knn_filtered(&[0.0, 0.0], 5, 50, "category", "code").unwrap();
+        assert!(code_results.iter().any(|(id, _)| *id == 1), "id 1 should match 'code' after the update");
     }
 
     #[test]
