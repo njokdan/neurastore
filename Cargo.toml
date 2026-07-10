@@ -1,0 +1,23 @@
+[package]
+name = "neurastore"
+version = "0.1.0"
+edition = "2021"
+description = "NeuraStore: a unified storage/query engine for AI-native workloads"
+
+[[bin]]
+name = "neurastore"
+path = "src/main.rs"
+
+[lib]
+name = "neurastore"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+crc32fast = "1"
+thiserror = "1"
+
+[dev-dependencies]
+tempfile = "=3.10.1"

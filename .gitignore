@@ -1,0 +1,17 @@
+# Rust
+/target
+
+# Python (benchmark harness)
+bench/venv/
+__pycache__/
+*.pyc
+
+# Benchmark datasets (large, regenerable via prepare_dataset.py -- don't commit)
+bench/data/*.npy
+bench/data/*.tar.gz
+bench/data/sift*
+bench/data/siftsmall*
+
+# OS cruft
+.DS_Store
+Thumbs.db
