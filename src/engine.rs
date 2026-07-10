@@ -8,17 +8,29 @@
 //! memtable -> newest SSTable -> ... -> oldest SSTable. First match
 //! wins; a tombstone match means "definitely deleted," not "keep
 //! looking," or a delete would resurrect once the memtable clears.
+//!
+//! Phase 3: the vector index (`vector_index: Option<Arc<RwLock<VectorIndex>>>`)
+//! is now kept incrementally in sync with every `put`/`put_batch`/`delete`
+//! once it's been built once -- no more full `build_index()` rebuild
+//! required after the first call. The `Arc<RwLock<_>>` wrapper is what
+//! makes concurrent access safe: `index_handle()` hands out a cloneable,
+//! independently lockable reference so multiple threads can hold read
+//! locks for `search` simultaneously, while a writer briefly takes a
+//! write lock to insert or delete. Coarse-grained (a writer blocks all
+//! readers for the duration of one graph insert), not lock-free -- see
+//! `vector_index.rs` for why that tradeoff was chosen deliberately.
 
+use crate::hnsw::HnswParams;
 use crate::memtable::MemTable;
 use crate::record::{Record, RecordId};
 use crate::sstable::{self, SSTableError, SSTableReader};
 use crate::vector_index::VectorIndex;
-use crate::hnsw::HnswParams;
 use crate::wal::{Wal, WalError};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 #[derive(thiserror::Error, Debug)]
 pub enum EngineError {
@@ -46,11 +58,12 @@ pub struct Engine {
     next_sstable_id: u64,
     seq: AtomicU64,
     flush_threshold: usize,
-    /// Phase 2: static vector index, built on demand via `build_index()`
-    /// from a snapshot of `scan_live()`. None until the first call, and
-    /// silently stale after further writes until rebuilt -- Phase 3
-    /// replaces this with an index that updates incrementally instead.
-    vector_index: Option<VectorIndex>,
+    /// Phase 3: incrementally-maintained vector index. `None` until the
+    /// first `build_index()` call; after that, every `put`/`put_batch`/
+    /// `delete` updates it in place (see those methods) instead of
+    /// requiring a rebuild. `Arc<RwLock<_>>` so `index_handle()` can hand
+    /// out a reference safe to use concurrently from other threads.
+    vector_index: Option<Arc<RwLock<VectorIndex>>>,
 }
 
 impl Engine {
@@ -130,6 +143,14 @@ impl Engine {
     ) -> Result<(), EngineError> {
         let record = Record::new(id, vector, metadata, self.next_seq());
         self.wal.append(&record)?;
+        // Keep the vector index in sync incrementally, if one exists --
+        // this is the Phase 3 change: no more "call build_index() again
+        // after every write." A fresh id extends the graph; an id that
+        // already existed there is treated as an update (the insert
+        // implicitly clears any prior tombstone -- see vector_index.rs).
+        if let Some(index) = &self.vector_index {
+            index.write().expect("vector index lock poisoned").insert(id, &record.vector);
+        }
         self.memtable.insert(record);
         self.maybe_flush()?;
         Ok(())
@@ -152,6 +173,15 @@ impl Engine {
             .map(|(id, vector, metadata)| Record::new(id, vector, metadata, self.next_seq()))
             .collect();
         self.wal.append_batch(&records)?;
+        if let Some(index) = &self.vector_index {
+            // One write-lock acquisition for the whole batch, not one
+            // per record -- same "amortize the lock/lock-adjacent cost"
+            // principle as the WAL batching fix, applied to the index.
+            let mut guard = index.write().expect("vector index lock poisoned");
+            for record in &records {
+                guard.insert(record.id, &record.vector);
+            }
+        }
         for record in records {
             self.memtable.insert(record);
         }
@@ -162,6 +192,9 @@ impl Engine {
     pub fn delete(&mut self, id: RecordId) -> Result<(), EngineError> {
         let seq = self.next_seq();
         self.wal.append(&Record::tombstone(id, seq))?;
+        if let Some(index) = &self.vector_index {
+            index.write().expect("vector index lock poisoned").delete(id);
+        }
         self.memtable.delete(id, seq);
         self.maybe_flush()?;
         Ok(())
@@ -222,18 +255,18 @@ impl Engine {
         self.sstables.len()
     }
 
-    /// Build (or rebuild) the vector index from a fresh snapshot of all
-    /// live records. Phase 2 is deliberately explicit about this instead
-    /// of auto-rebuilding on every write -- that would make writes pay
-    /// an unpredictable, corpus-size-dependent cost. Call this once
-    /// after loading/writing a batch, before querying.
+    /// Build the vector index from a fresh snapshot of all live records.
+    /// After this first call, `put`/`put_batch`/`delete` keep it in sync
+    /// incrementally -- calling this again fully replaces it (useful for
+    /// periodic re-optimization or reclaiming space from accumulated
+    /// tombstones, but not required for correctness after the first call).
     pub fn build_index(&mut self) {
         self.build_index_with_params(HnswParams::default(), 42);
     }
 
     pub fn build_index_with_params(&mut self, params: HnswParams, seed: u64) {
         let records = self.scan_live();
-        self.vector_index = Some(VectorIndex::build(&records, params, seed));
+        self.vector_index = Some(Arc::new(RwLock::new(VectorIndex::build(&records, params, seed))));
     }
 
     pub fn has_index(&self) -> bool {
@@ -241,14 +274,28 @@ impl Engine {
     }
 
     pub fn index_len(&self) -> Option<usize> {
-        self.vector_index.as_ref().map(|idx| idx.len())
+        self.vector_index.as_ref().map(|idx| idx.read().expect("vector index lock poisoned").len())
+    }
+
+    /// A cloneable, independently-lockable handle to the vector index,
+    /// safe to send to another thread and use concurrently with this
+    /// `Engine` (whose other parts -- WAL, memtable, SSTables -- are
+    /// *not* thread-safe; only the vector index is, as of Phase 3). This
+    /// is what makes "query from one thread while inserting from
+    /// another" possible: hand the handle to a reader thread, keep
+    /// calling `put`/`delete` on the `Engine` (or another handle) from
+    /// elsewhere. Returns `None` if `build_index()` hasn't been called yet.
+    pub fn index_handle(&self) -> Option<Arc<RwLock<VectorIndex>>> {
+        self.vector_index.clone()
     }
 
     /// Approximate k-nearest-neighbor search against the built index.
     /// Returns `None` if `build_index()` hasn't been called yet --
     /// callers should treat that as "index not ready," not "no results."
     pub fn search_knn(&self, query: &[f32], k: usize, ef_search: usize) -> Option<Vec<(RecordId, f32)>> {
-        self.vector_index.as_ref().map(|idx| idx.search(query, k, ef_search))
+        self.vector_index
+            .as_ref()
+            .map(|idx| idx.read().expect("vector index lock poisoned").search(query, k, ef_search))
     }
 
     fn maybe_flush(&mut self) -> Result<(), EngineError> {
@@ -461,6 +508,146 @@ mod tests {
             "expected put_batch ({batch_elapsed:?}) to meaningfully beat {} individual puts ({individual_elapsed:?})",
             300
         );
+    }
+
+    #[test]
+    fn index_stays_in_sync_incrementally_without_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::open(dir.path()).unwrap();
+
+        engine.put(1, vec![0.0, 0.0], HashMap::new()).unwrap();
+        engine.put(2, vec![10.0, 10.0], HashMap::new()).unwrap();
+        engine.build_index(); // first build, from a snapshot
+        assert_eq!(engine.index_len(), Some(2));
+
+        // These happen AFTER build_index() -- the Phase 3 claim is that
+        // no second build_index() call is needed for them to show up in
+        // search results.
+        engine.put(3, vec![0.1, 0.1], HashMap::new()).unwrap();
+        engine.put(4, vec![10.1, 10.1], HashMap::new()).unwrap();
+        assert_eq!(engine.index_len(), Some(4), "index should have grown incrementally, not stayed at 2");
+
+        let results = engine.search_knn(&[0.0, 0.0], 2, 20).unwrap();
+        let ids: Vec<RecordId> = results.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&1));
+        assert!(ids.contains(&3), "record 3, added after build_index(), should be findable without a rebuild");
+    }
+
+    #[test]
+    fn delete_after_build_removes_id_from_search_without_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::open(dir.path()).unwrap();
+
+        engine.put(1, vec![0.0, 0.0], HashMap::new()).unwrap();
+        engine.put(2, vec![0.01, 0.01], HashMap::new()).unwrap();
+        engine.build_index();
+
+        engine.delete(2).unwrap();
+        let results = engine.search_knn(&[0.0, 0.0], 5, 20).unwrap();
+        let ids: Vec<RecordId> = results.iter().map(|(id, _)| *id).collect();
+        assert!(!ids.contains(&2), "deleted record should not appear in search results without a rebuild");
+        assert!(ids.contains(&1));
+    }
+
+    #[test]
+    fn put_batch_after_build_extends_index_in_one_lock_acquisition() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::open(dir.path()).unwrap();
+        engine.put(1, vec![0.0, 0.0], HashMap::new()).unwrap();
+        engine.build_index();
+
+        let entries: Vec<(RecordId, Vec<f32>, HashMap<String, String>)> =
+            (2..=50).map(|i| (i, vec![i as f32, i as f32], HashMap::new())).collect();
+        engine.put_batch(entries).unwrap();
+
+        assert_eq!(engine.index_len(), Some(50));
+    }
+
+    #[test]
+    fn concurrent_reads_and_writes_are_actually_thread_safe() {
+        // The real Phase 3 concurrency claim, proven with real OS
+        // threads (not just "the types happen to allow it"). One writer
+        // thread inserts continuously; several reader threads query
+        // concurrently the whole time. If anything about the locking
+        // were wrong, this would panic (poisoned lock), deadlock (test
+        // hangs past cargo's default timeout), or -- if some unsafe
+        // shortcut had been taken instead of RwLock -- corrupt data in a
+        // way `len()` at the end would catch.
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::open(dir.path()).unwrap();
+        // Seed with an initial batch so readers have something to search
+        // from the moment threads start, not just an empty index.
+        let seed_entries: Vec<(RecordId, Vec<f32>, HashMap<String, String>)> =
+            (0..200).map(|i| (i, vec![i as f32, (i % 13) as f32], HashMap::new())).collect();
+        engine.put_batch(seed_entries).unwrap();
+        engine.build_index();
+
+        let handle = engine.index_handle().expect("index should exist after build_index");
+
+        thread::scope(|scope| {
+            // 4 concurrent reader threads, searching continuously.
+            for _ in 0..4 {
+                let reader_handle = handle.clone();
+                scope.spawn(move || {
+                    for i in 0..300 {
+                        let query = vec![(i % 200) as f32, ((i % 200) % 13) as f32];
+                        let guard = reader_handle.read().expect("read lock should not be poisoned");
+                        let _ = guard.search(&query, 5, 20);
+                        // Lock released at end of each iteration -- this
+                        // is what lets the writer thread interleave in.
+                    }
+                });
+            }
+
+            // 1 writer thread, inserting new records the whole time the
+            // readers are also running.
+            let writer_handle = handle.clone();
+            scope.spawn(move || {
+                for i in 200..400u64 {
+                    let mut guard = writer_handle.write().expect("write lock should not be poisoned");
+                    guard.insert(i, &[i as f32, (i % 13) as f32]);
+                }
+            });
+        });
+        // thread::scope only returns once every spawned thread has
+        // finished -- reaching here at all (no panic, no hang) is most
+        // of the proof. The length check below confirms the writes that
+        // happened *during* concurrent reading weren't lost or corrupted.
+
+        let final_len = handle.read().unwrap().len();
+        assert_eq!(final_len, 400, "expected all 200 seed + 200 concurrently-inserted records to be present");
+    }
+
+    #[test]
+    fn incremental_and_rebuilt_index_report_consistent_state() {
+        // Sanity check that build_index() (full rebuild) and the
+        // incremental path agree on final state when applied to the same
+        // sequence of writes -- they should, since build_index() just
+        // re-derives from the same scan_live() the incremental path was
+        // already keeping in sync with.
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::open(dir.path()).unwrap();
+
+        for i in 1..=100u64 {
+            engine.put(i, vec![i as f32], HashMap::new()).unwrap();
+        }
+        engine.build_index();
+        for i in 101..=150u64 {
+            engine.put(i, vec![i as f32], HashMap::new()).unwrap();
+        }
+        engine.delete(5).unwrap();
+        engine.delete(105).unwrap();
+
+        let incremental_len = engine.index_len().unwrap();
+
+        // Force a full rebuild from the current live state and compare.
+        engine.build_index();
+        let rebuilt_len = engine.index_len().unwrap();
+
+        assert_eq!(incremental_len, rebuilt_len);
+        assert_eq!(rebuilt_len, 148); // 150 inserted - 2 deleted
     }
 
     #[test]
