@@ -422,11 +422,22 @@ detection) is intentionally deferred to a later phase, discussed
 separately and scoped down from an earlier, more expansive version of
 that idea to something concrete and buildable.
 
-**Run it:**
+**Run it (from source):**
 ```bash
 cargo run --release --bin server -- ./data 8080
 curl http://localhost:8080/health
 ```
+
+**Run it (Docker — no Rust toolchain needed):**
+```bash
+docker compose up --build
+curl http://localhost:8080/health
+```
+First build compiles from scratch (LTO makes this slow — a few minutes,
+one-time cost). Data persists in a named Docker volume across container
+restarts. **Not yet build-tested against a real Docker daemon** — written
+carefully, but this sandbox has no Docker available to verify against;
+flag anything that doesn't work as written.
 
 **This also finally unlocks the fair latency comparison deferred since
 Phase 0**: `bench/scripts/bench_neurastore_http.py` benchmarks NeuraStore
@@ -544,6 +555,51 @@ actually seen (mostly consistent, occasional huge spikes):
    runs — this project's own experience is the best argument for this:
    several "findings" here only looked real until a second or third run
    contradicted them.
+
+## Status: Phase 6 — Usability (in progress)
+
+Goal, stated plainly: a stranger should be able to `pip install` a
+client, point it at a running server, and be querying NeuraStore in
+five minutes — no Rust, no hand-built HTTP requests.
+
+**Docker** (`Dockerfile`, `docker-compose.yml`) — run the server without
+installing a Rust toolchain: `docker compose up --build`. Written
+carefully but not build-tested against a real Docker daemon (this
+sandbox has none) — flag anything that doesn't work as written.
+
+**Python client** (`client/python/`, package `neurastore-client`) — an
+ergonomic wrapper (`NeuraStoreClient`) around the full HTTP API: insert,
+batch insert (JSON or binary), get, delete, build_index, search,
+search_filtered, stats. Only depends on `requests` — vectors are plain
+lists, no numpy required. Translates HTTP status codes into a proper
+exception hierarchy (`NotFoundError`, `BadRequestError`, `ServerError`,
+`ConnectionError`) instead of leaking raw `requests` exceptions. Uses a
+persistent `requests.Session` internally — not a style choice: skipping
+this was directly responsible for a real ~2-second-per-request penalty
+found earlier in this project's own benchmark tooling (Windows'
+localhost-then-IPv6-fallback DNS behavior), and a client library
+shouldn't hand that bug to everyone who uses it.
+
+23 tests: 18 unit tests (mocked HTTP, no server needed) + 5 integration
+tests (run against a real live server — verified in this sandbox, all
+passing) covering the full insert→build→search→filtered-search→delete
+lifecycle. The README's own quickstart example was run verbatim against
+a real server to confirm the documented experience actually works
+exactly as written.
+
+```bash
+cd client/python
+pip install -e .
+```
+```python
+from neurastore_client import NeuraStoreClient
+client = NeuraStoreClient("http://localhost:8080")
+client.insert(1, [0.1, 0.2, 0.3], metadata={"category": "docs"})
+client.build_index()
+results = client.search([0.1, 0.2, 0.3], k=5)
+```
+
+**Still ahead in this phase:** a CLI tool built on this same client.
 
 ## Deliberately out of scope for now
 

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neurastore-client"
+version = "0.1.0"
+description = "Python client for NeuraStore, a unified vector + structured-filter database engine"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+dependencies = [
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0", "responses>=0.23"]
+
+[project.urls]
+Homepage = "https://github.com/your-username/neurastore"
+Repository = "https://github.com/your-username/neurastore"
+
+[tool.setuptools.packages.find]
+include = ["neurastore_client*"]

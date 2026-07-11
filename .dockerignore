@@ -1,0 +1,7 @@
+target/
+bench/data/*.npy
+bench/data/*.tar.gz
+bench/data/sift*
+bench/venv/
+.git/
+*.tar.gz

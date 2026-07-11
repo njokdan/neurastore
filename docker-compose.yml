@@ -1,0 +1,15 @@
+services:
+  neurastore:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - neurastore_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  neurastore_data:
