@@ -3,3 +3,9 @@ psycopg2-binary>=2.9
 pymilvus>=2.4,<2.5
 tqdm>=4.66
 requests>=2.31
+orjson>=3.9
+
+# pymilvus 2.4.x still imports pkg_resources internally, which setuptools
+# removed starting ~v80/81 (2025). Pin below that so fresh venvs don't
+# hit "ModuleNotFoundError: No module named 'pkg_resources'".
+setuptools<81

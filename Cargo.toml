@@ -13,8 +13,10 @@ name = "neurastore"
 path = "src/lib.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "net", "signal"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+axum = "0.7"
 bincode = "1"
 crc32fast = "1"
 thiserror = "1"
@@ -24,6 +26,7 @@ rayon-core = "=1.12.1"
 
 [dev-dependencies]
 tempfile = "=3.10.1"
+tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 # The hot paths here (squared_l2 distance computation, graph traversal)

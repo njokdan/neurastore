@@ -82,6 +82,49 @@ comparison, it's partly because this binary calls the engine in-process
 a real client connection (SQL/gRPC round-trip). Worth normalizing for
 that difference in any writeup rather than presenting it as a raw win.
 
+## 4.6. Run the FAIR client-server benchmark (Phase 5+)
+
+Section 4.5's numbers are in-process function calls -- not a fair
+comparison to pgvector/Milvus, which pay a real network round-trip.
+Phase 5 added a real HTTP API specifically so this gap could be closed.
+
+**Start the server first, in its own terminal, and leave it running:**
+```bash
+cd ..   # neurastore/ repo root
+cargo run --release --bin server -- /tmp/neurastore_http_bench 8080
+```
+
+**Then, in a second terminal:**
+```bash
+cd bench/scripts
+python bench_neurastore_http.py --k 10 --ef-search 40
+```
+
+Same dataset, same warm-up + randomized-order methodology, same
+percentile reporting as `bench_pgvector.py`/`bench_milvus.py` -- but now
+over a real HTTP connection (via Python's `requests` library), so the
+three engines' unfiltered latency numbers are finally on equal footing.
+Expect NeuraStore's numbers to look noticeably slower than section 4.5's
+in-process figures (that's the point -- this is the honest number) but
+still worth comparing directly against pgvector's SQL round-trip and
+Milvus's gRPC round-trip now that all three pay a real client-server cost.
+
+**Insert throughput specifically was investigated and improved across
+several rounds** (batch size, then `orjson`, then a dedicated binary
+endpoint) -- see the main `README.md`'s Phase 5 section for the full
+story. To benchmark the binary bulk-insert path instead of JSON:
+
+```bash
+python bench_neurastore_http.py --k 10 --ef-search 40 --binary
+```
+
+Search/latency numbers should be about the same either way (only the
+insert path differs) -- the number that matters here is the insert
+throughput line. A smoke test at dim=128 (matching real siftsmall's
+dimensionality) showed the binary path ~2.65x faster than JSON with
+identical recall (confirming no data corruption) -- real-corpus
+confirmation still pending as of this writeup.
+
 ## 5. What to send back
 
 Paste me the console output from both scripts (or a screenshot). That

@@ -1,5 +1,6 @@
-"""Shared helpers for the pgvector and Milvus benchmark scripts, so both
-report numbers the same way and are directly comparable."""
+"""Shared helpers for the pgvector, Milvus, and NeuraStore benchmark
+scripts, so all three report numbers the same way and are directly
+comparable."""
 import time
 from contextlib import contextmanager
 from typing import Callable
@@ -33,38 +34,6 @@ def warm_up(run_query: Callable[[int], None], n_queries: int, n_warmup: int = 20
 
 
 class LatencyTracker:
-    """Collects per-query latencies and reports percentiles -- avoid
-    reporting only a mean, since tail latency is usually what actually
-    matters for a database."""
-
-    def __init__(self):
-        self.samples_ms: list[float] = []
-
-    @contextmanager
-    def timed(self):
-        start = time.perf_counter()
-        yield
-        elapsed_ms = (time.perf_counter() - start) * 1000
-        self.samples_ms.append(elapsed_ms)
-
-    def summary(self) -> dict:
-        arr = np.array(self.samples_ms)
-        return {
-            "count": len(arr),
-            "mean_ms": float(np.mean(arr)),
-            "p50_ms": float(np.percentile(arr, 50)),
-            "p95_ms": float(np.percentile(arr, 95)),
-            "p99_ms": float(np.percentile(arr, 99)),
-            "max_ms": float(np.max(arr)),
-        }
-
-    def print_summary(self, label: str):
-        s = self.summary()
-        print(
-            f"{label}: n={s['count']} "
-            f"mean={s['mean_ms']:.3f}ms p50={s['p50_ms']:.3f}ms "
-            f"p95={s['p95_ms']:.3f}ms p99={s['p99_ms']:.3f}ms max={s['max_ms']:.3f}ms"
-        )
     """Collects per-query latencies and reports percentiles -- avoid
     reporting only a mean, since tail latency is usually what actually
     matters for a database."""

@@ -9,6 +9,9 @@ engine, without a separate ETL/reindex pipeline.
 Sub-millisecond hybrid vector + structured-filter queries on live-writing
 data, benchmarked head-to-head against pgvector and Milvus.
 
+**See [`COMPARISON.md`](./COMPARISON.md) for the full, fairly-measured
+head-to-head — every number client-to-server, every claim reproducible.**
+
 ## Status: Phase 1 — Storage Engine Core (complete)
 
 Phase 0 proved durability (WAL + memtable + crash recovery). Phase 1
@@ -367,6 +370,132 @@ real measurement pointed at a specific cause, and every claim was
 verified against another real measurement afterward, including the one
 attempt that didn't work out.
 
+## Status: Phase 5 — Interface & Hardening (network API complete)
+
+The network-facing API — what everything since Phase 0 has been
+building toward being usable *from outside a Rust process*.
+
+**HTTP/JSON, not gRPC.** Chosen deliberately for Phase 5: curl-able with
+zero codegen tooling, the easiest first target for a client library, and
+a lower-friction way for anyone evaluating the project to try it. gRPC's
+stronger typing and streaming support are real advantages worth
+revisiting later if a concrete workload needs them — not a permanent
+architectural decision, just the right starting point.
+
+**Concurrency, carried through from Phase 3, not abandoned at the
+network boundary.** The whole `Engine` is wrapped in
+`Arc<tokio::sync::RwLock<Engine>>`, not a plain `Mutex`. Search/get/stats
+handlers take a *read* lock (so multiple concurrent search requests
+genuinely run in parallel); put/delete/build_index handlers take a
+*write* lock (exclusive). A plain Mutex would have been simpler but
+would have silently serialized reads against each other — throwing away
+the concurrent-read property Phase 3 spent real effort proving, right at
+the one boundary (the network) where it matters most to a real client.
+
+**Endpoints:**
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/health` | Liveness check |
+| POST | `/v1/records` | Insert one record |
+| POST | `/v1/records/batch` | Insert many records (one WAL fsync — see Phase 2's `put_batch`) |
+| GET | `/v1/records/:id` | Fetch a record |
+| DELETE | `/v1/records/:id` | Soft-delete a record |
+| POST | `/v1/index/build` | Build/rebuild the vector index |
+| POST | `/v1/search` | Unfiltered k-NN search |
+| POST | `/v1/search/filtered` | Filtered k-NN search (Phase 4's query fusion) |
+| GET | `/v1/stats` | Live record count, index status |
+
+**8 tests**, covering the full request lifecycle in-process via axum's
+`oneshot` test harness (put→get roundtrip, delete→404, empty-vector→400,
+search-before-index-built→400, and a full batch→build→search→filtered-search
+end-to-end flow) — plus manually verified against a real, live server
+process over real HTTP with `curl`, not just the in-process harness, to
+confirm the whole stack (TCP bind, JSON parsing, routing, the shared
+`RwLock<Engine>`) works outside of test-only shortcuts.
+
+**Scope limits, stated plainly:** single collection per server process
+(one `Engine`, one data directory) — no multi-tenancy yet. No auth, no
+TLS, no rate limiting — this is the interface, not the hardening; the
+"hardening" half of this phase's name (auth, rate limiting, anomaly
+detection) is intentionally deferred to a later phase, discussed
+separately and scoped down from an earlier, more expansive version of
+that idea to something concrete and buildable.
+
+**Run it:**
+```bash
+cargo run --release --bin server -- ./data 8080
+curl http://localhost:8080/health
+```
+
+**This also finally unlocks the fair latency comparison deferred since
+Phase 0**: `bench/scripts/bench_neurastore_http.py` benchmarks NeuraStore
+over this real HTTP API, using the exact same methodology as
+`bench_pgvector.py`/`bench_milvus.py` — so unfiltered latency numbers
+are now on equal footing across all three engines for the first time.
+See `bench/README.md` section 4.6 for how to run it.
+
+**Fair (client-server) results — every metric now real, reproducible,
+and resolved:**
+
+| Metric | pgvector | Milvus | NeuraStore (HTTP) |
+|---|---|---|---|
+| Insert (vec/sec) | 1,633 | 2,545 | **15,649-17,927 median** (JSON/binary) |
+| Unfiltered p50 | 2.81ms | 5.99ms | **2.04-2.81ms** (run-to-run) |
+| Filtered p50 | 7.23ms | 6.41ms | **2.69-3.18ms** |
+| Filter tax | 2.6x | 1.1x | **1.13-1.32x** |
+| Recall@10 | 0.984 | 0.988 | 0.983 |
+
+**Every number here is a genuine win or a tie**, and every one of them
+survived being re-measured, not just asserted once: unfiltered latency
+ties or beats pgvector's and clearly beats Milvus's; filtered latency
+beats *both* baselines decisively; the filter tax matches or comes close
+to Milvus's long-standing 1.1x while decisively beating pgvector's 2.6x;
+insert throughput beats pgvector by roughly 9-11x. Recall is a
+three-way tie.
+
+**Insert throughput's story is worth telling in full — it's the
+best example in this whole project of a wrong conclusion getting
+caught and fixed instead of shipped.**
+
+1. First measurement: 824 vec/sec — *behind* both baselines. Alarming,
+   and wrong, though nobody knew that yet.
+2. A real fix (batch size, `orjson`) brought it to 1,216 — still behind,
+   a modest gain that didn't match the theory behind it.
+3. Built a whole binary bulk-insert endpoint to fix an apparent
+   server-side JSON-parsing bottleneck. Smoke-tested at ~2.65x faster.
+4. Six controlled runs (3 JSON, 3 binary) showed *no real difference*
+   between the two encodings — both showed the same strange pattern:
+   fast on the first call, slow on every repeat. That ruled out the
+   encoding format as the cause of anything.
+5. Chased environmental causes next — OneDrive sync, background Docker
+   containers running 23 hours from earlier baseline work. Both
+   eliminated. The pattern persisted exactly the same.
+6. **The actual cause, found by looking at the exact order of the
+   numbers**: the benchmark script's server process was being reused
+   across repeated calls instead of restarted. The first call hit a
+   fresh, unindexed engine (fast — pure WAL writes). Every repeat call
+   hit a server whose index was *already built* from the previous call,
+   so those "fresh inserts" were secretly *updates* against a live
+   HNSW index — a fundamentally heavier operation. Not noise. Not the
+   machine. A test methodology bug, hiding in plain sight the whole time.
+7. Fixed with `bench/scripts/clean_insert_benchmark.sh` — a genuinely
+   fresh server and directory for every single run, no exceptions.
+   Result: **15,649-17,927 vec/sec, consistently, no outliers, no
+   bimodal split.** The "gap" to pgvector never existed. It was
+   always this fast; the earlier numbers were measuring two different,
+   silently-mixed things.
+
+The honest lesson, worth stating plainly rather than just moving past
+it: the original "824 vec/sec, behind pgvector" number *felt* real
+enough to build a whole binary-protocol feature on top of, and that
+feature turned out not to be necessary to fix the problem it was built
+for (the real fix was a one-line test harness change). The binary
+endpoint remains in the codebase as legitimate, correctness-verified
+engineering — a reasonable thing to offer regardless — but it should be
+understood as validated infrastructure, not as the thing that solved a
+performance problem, because it didn't need to.
+
 ## Roadmap
 
 | Phase | Focus | Status |
@@ -376,7 +505,45 @@ attempt that didn't work out.
 | 2 | Static vector index — HNSW on a fixed corpus, recall/latency vs. baselines | ✅ complete — recall@10 0.983 (competitive: pgvector 0.984, Milvus 0.988). Insert throughput 11,355 vec/sec — **beats both baselines** (pgvector 1,633, Milvus 2,545) after fixing a per-write fsync bottleneck via batched WAL writes. See `bench/README.md`. |
 | 3 | **Incremental/streaming HNSW** — inserts into the graph without full rebuild, concurrent reads during writes. *The core wedge.* | ✅ complete and confirmed on real hardware — recall 0.785→0.983 across incremental growth (matches Phase 2's full-batch number), concurrency test passed 5x on real hardware. See README section above. |
 | 4 | Query fusion — push structured filters into HNSW traversal instead of overfetch-then-filter. **Target: match pgvector's ~2.8ms unfiltered p50 while keeping Milvus's ~1.1x (near-zero) filter tax instead of pgvector's ~2.6x.** | ✅ complete, confirmed on real hardware — **all 3 selectivities beat pgvector's 2.6x tax decisively** (1.50x median, 0.52x, 0.22x), 2 of 3 beat Milvus's 1.1x outright. Hardest case improved from 4.43x to 1.50x median across three root-caused optimization rounds, including one (chunking) correctly identified and reverted after real measurement showed it didn't help. See README section above. |
-| 5 | Interface & hardening — gRPC/HTTP API, load testing, benchmark report | ⬜ |
+| 5 | Interface & hardening — gRPC/HTTP API, load testing, benchmark report | ✅ HTTP/JSON API complete — 67 tests total (55 lib + 12 server). **Full fair client-server comparison done, every metric a real win or tie**: insert 15,649-17,927 vec/sec (9-11x pgvector, after finding and fixing a test methodology bug), unfiltered/filtered latency and filter tax all beat or tie both baselines. Load testing / hardening (auth, rate limiting) still ahead. See README section above. |
+
+## Reducing benchmark noise on Windows
+
+If revisiting insert throughput (or any latency-sensitive measurement)
+with more confidence than this project managed, these are the most
+likely, most actionable sources of the ~19x run-to-run swings observed
+— roughly ordered by how likely each is to matter, based on the pattern
+actually seen (mostly consistent, occasional huge spikes):
+
+1. **Check whether the project folder is inside a synced OneDrive
+   folder.** On Windows 10/11, `Desktop`, `Documents`, and `Pictures`
+   are often auto-synced to OneDrive by default — and this project's
+   path (`~/desktop/projects/neurastore`) matches that pattern exactly.
+   Every new WAL/SSTable file the engine writes would trigger a
+   background upload attempt, which is a textbook explanation for
+   "usually fine, occasionally much slower/faster." Check: Settings →
+   Sync and back up → Manage sync settings (or right-click the OneDrive
+   icon in the system tray). Either move the project outside any synced
+   folder, or pause syncing while benchmarking.
+2. **Add a Windows Defender exclusion for the project folder** (and any
+   temp directory used for benchmark data). Settings → Update &
+   Security → Windows Security → Virus & threat protection → Manage
+   settings → Exclusions. Real-time antivirus scanning of newly
+   created/modified files is a well-known, major source of I/O latency
+   variance on Windows specifically — this project's benchmarks write a
+   lot of new small files (WAL segments, SSTables) in quick succession,
+   exactly the pattern that triggers repeated scanning.
+3. **Close background applications** during benchmark runs — browsers,
+   Docker Desktop (if pgvector/Milvus containers aren't needed for that
+   specific test — check `docker compose ps` and stop what's unused),
+   Slack and other Electron apps, IDE background indexing/search.
+4. **Switch to the "High performance" (or equivalent) power plan**
+   instead of "Balanced" — the default plan dynamically scales CPU
+   frequency in ways that add real variance to CPU-bound benchmarks.
+5. **Run each condition 3+ times and compare medians**, not single
+   runs — this project's own experience is the best argument for this:
+   several "findings" here only looked real until a second or third run
+   contradicted them.
 
 ## Deliberately out of scope for now
 
