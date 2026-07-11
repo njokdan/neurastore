@@ -435,9 +435,11 @@ curl http://localhost:8080/health
 ```
 First build compiles from scratch (LTO makes this slow — a few minutes,
 one-time cost). Data persists in a named Docker volume across container
-restarts. **Not yet build-tested against a real Docker daemon** — written
-carefully, but this sandbox has no Docker available to verify against;
-flag anything that doesn't work as written.
+restarts. **Verified on real hardware**: built successfully, served real
+requests, and data survived a full `docker compose down` (container
+completely torn down, not just stopped) followed by `docker compose up`
+— confirming the volume mount, not just the process staying alive, is
+what's keeping the data.
 
 **This also finally unlocks the fair latency comparison deferred since
 Phase 0**: `bench/scripts/bench_neurastore_http.py` benchmarks NeuraStore
@@ -563,9 +565,10 @@ client, point it at a running server, and be querying NeuraStore in
 five minutes — no Rust, no hand-built HTTP requests.
 
 **Docker** (`Dockerfile`, `docker-compose.yml`) — run the server without
-installing a Rust toolchain: `docker compose up --build`. Written
-carefully but not build-tested against a real Docker daemon (this
-sandbox has none) — flag anything that doesn't work as written.
+installing a Rust toolchain: `docker compose up --build`. **Verified on
+real hardware**: image builds, container serves real requests, and data
+correctly persists across a full `docker compose down` + `up` cycle
+(confirming the volume mount, not just process uptime, keeps the data).
 
 **Python client** (`client/python/`, package `neurastore-client`) — an
 ergonomic wrapper (`NeuraStoreClient`) around the full HTTP API: insert,
