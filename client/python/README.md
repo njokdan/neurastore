@@ -78,6 +78,43 @@ Exception hierarchy:
 This client only depends on `requests` — no numpy required. Pass any
 sequence of numbers (`list`, `tuple`, or a numpy array via `.tolist()`).
 
+## CLI
+
+Installing the package also installs a `neurastore` command:
+
+```bash
+export NEURASTORE_URL=http://localhost:8080   # or pass --url every time
+
+neurastore health
+neurastore insert --id 1 --vector 0.1,0.2,0.3 --metadata category=docs
+neurastore insert --id 2 --vector 0.9,0.8,0.7 --metadata category=code
+neurastore build-index
+neurastore search --vector 0.1,0.2,0.3 --k 5
+neurastore search-filtered --vector 0.1,0.2,0.3 --field category --value docs
+neurastore stats
+neurastore get --id 1
+neurastore delete --id 1
+```
+
+Bulk load from a JSON file (a list of `{id, vector, metadata}` objects,
+or `-` for stdin):
+
+```bash
+neurastore insert-batch --file records.json
+neurastore insert-batch --file records.json --binary   # binary wire format
+```
+
+Add `--json` before the subcommand for machine-readable output:
+
+```bash
+neurastore --json stats
+neurastore --json search --vector 0.1,0.2,0.3
+```
+
+Errors print a clear message to stderr and exit with status 1, instead
+of a Python traceback — safe to script against
+(`neurastore get --id 1 || echo "not found"`).
+
 ## Running tests
 
 ```bash

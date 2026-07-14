@@ -17,8 +17,11 @@ dependencies = [
 test = ["pytest>=7.0", "responses>=0.23"]
 
 [project.urls]
-Homepage = "https://github.com/njokdan/neurastore"
-Repository = "https://github.com/njokdan/neurastore"
+Homepage = "https://github.com/your-username/neurastore"
+Repository = "https://github.com/your-username/neurastore"
+
+[project.scripts]
+neurastore = "neurastore_client.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["neurastore_client*"]

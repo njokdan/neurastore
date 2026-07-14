@@ -519,6 +519,7 @@ performance problem, because it didn't need to.
 | 3 | **Incremental/streaming HNSW** — inserts into the graph without full rebuild, concurrent reads during writes. *The core wedge.* | ✅ complete and confirmed on real hardware — recall 0.785→0.983 across incremental growth (matches Phase 2's full-batch number), concurrency test passed 5x on real hardware. See README section above. |
 | 4 | Query fusion — push structured filters into HNSW traversal instead of overfetch-then-filter. **Target: match pgvector's ~2.8ms unfiltered p50 while keeping Milvus's ~1.1x (near-zero) filter tax instead of pgvector's ~2.6x.** | ✅ complete, confirmed on real hardware — **all 3 selectivities beat pgvector's 2.6x tax decisively** (1.50x median, 0.52x, 0.22x), 2 of 3 beat Milvus's 1.1x outright. Hardest case improved from 4.43x to 1.50x median across three root-caused optimization rounds, including one (chunking) correctly identified and reverted after real measurement showed it didn't help. See README section above. |
 | 5 | Interface & hardening — gRPC/HTTP API, load testing, benchmark report | ✅ HTTP/JSON API complete — 67 tests total (55 lib + 12 server). **Full fair client-server comparison done, every metric a real win or tie**: insert 15,649-17,927 vec/sec (9-11x pgvector, after finding and fixing a test methodology bug), unfiltered/filtered latency and filter tax all beat or tie both baselines. Load testing / hardening (auth, rate limiting) still ahead. See README section above. |
+| 6 | Usability — Docker, Python client, CLI | ✅ complete — all three verified on real hardware/live servers, not just written. 52 client-side tests (35 unit + 17 integration). See README section above. |
 
 ## Reducing benchmark noise on Windows
 
@@ -558,11 +559,12 @@ actually seen (mostly consistent, occasional huge spikes):
    several "findings" here only looked real until a second or third run
    contradicted them.
 
-## Status: Phase 6 — Usability (in progress)
+## Status: Phase 6 — Usability (complete)
 
 Goal, stated plainly: a stranger should be able to `pip install` a
 client, point it at a running server, and be querying NeuraStore in
-five minutes — no Rust, no hand-built HTTP requests.
+five minutes — no Rust, no hand-built HTTP requests. All three planned
+pieces are done and verified, not just written.
 
 **Docker** (`Dockerfile`, `docker-compose.yml`) — run the server without
 installing a Rust toolchain: `docker compose up --build`. **Verified on
@@ -583,13 +585,6 @@ found earlier in this project's own benchmark tooling (Windows'
 localhost-then-IPv6-fallback DNS behavior), and a client library
 shouldn't hand that bug to everyone who uses it.
 
-23 tests: 18 unit tests (mocked HTTP, no server needed) + 5 integration
-tests (run against a real live server — verified in this sandbox, all
-passing) covering the full insert→build→search→filtered-search→delete
-lifecycle. The README's own quickstart example was run verbatim against
-a real server to confirm the documented experience actually works
-exactly as written.
-
 ```bash
 cd client/python
 pip install -e .
@@ -602,7 +597,29 @@ client.build_index()
 results = client.search([0.1, 0.2, 0.3], k=5)
 ```
 
-**Still ahead in this phase:** a CLI tool built on this same client.
+**CLI** (`neurastore` command, installed by the same package) — a thin
+wrapper over the same client, using only the standard library's
+`argparse` to keep the install footprint small (no click/typer added
+just for CLI polish). Every subcommand run end-to-end against a real
+live server, not just unit-tested: health, insert, get, delete,
+build-index, search, search-filtered, stats (text and `--json`), and
+batch insert from a file — including confirming errors exit with status
+1 and a clear stderr message instead of a Python traceback, so it's
+safe to script against.
+
+```bash
+export NEURASTORE_URL=http://localhost:8080
+neurastore insert --id 1 --vector 0.1,0.2,0.3 --metadata category=docs
+neurastore build-index
+neurastore search --vector 0.1,0.2,0.3 --k 5
+```
+
+**52 client-side tests total** (35 unit — client + CLI, mocked HTTP,
+no server needed — + 17 integration/live-server tests across both
+suites), on top of the 67 Rust tests from Phases 0-5. Every documented
+example in this phase — the Python quickstart, every CLI command, the
+Docker persistence cycle — was actually run against a real server, not
+just written and assumed to work.
 
 ## Deliberately out of scope for now
 
