@@ -1,11 +1,13 @@
 services:
   neurastore:
-    # No direct host port when Caddy is terminating TLS in front --
-    # otherwise the plain-HTTP port would still be reachable directly,
-    # bypassing TLS entirely. Caddy reaches this service over the
-    # internal Docker network via its service name, which works
-    # regardless of whether a host port is published.
-    ports: []
+    # Docker Compose merges list-type fields (like `ports`) across
+    # override files by default -- it does NOT replace them. A plain
+    # `ports: []` here would just merge an empty list into the base
+    # file's `ports: ["8080:8080"]`, which has zero effect (verified:
+    # it didn't work). `!reset` explicitly tells Compose to clear the
+    # merged list instead of appending to it -- this is what actually
+    # removes the direct host port when TLS-terminating through Caddy.
+    ports: !reset []
 
   caddy:
     image: caddy:2-alpine
