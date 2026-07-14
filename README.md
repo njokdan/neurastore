@@ -520,7 +520,7 @@ performance problem, because it didn't need to.
 | 4 | Query fusion — push structured filters into HNSW traversal instead of overfetch-then-filter. **Target: match pgvector's ~2.8ms unfiltered p50 while keeping Milvus's ~1.1x (near-zero) filter tax instead of pgvector's ~2.6x.** | ✅ complete, confirmed on real hardware — **all 3 selectivities beat pgvector's 2.6x tax decisively** (1.50x median, 0.52x, 0.22x), 2 of 3 beat Milvus's 1.1x outright. Hardest case improved from 4.43x to 1.50x median across three root-caused optimization rounds, including one (chunking) correctly identified and reverted after real measurement showed it didn't help. See README section above. |
 | 5 | Interface & hardening — gRPC/HTTP API, load testing, benchmark report | ✅ HTTP/JSON API complete — 67 tests total (55 lib + 12 server). **Full fair client-server comparison done, every metric a real win or tie**: insert 15,649-17,927 vec/sec (9-11x pgvector, after finding and fixing a test methodology bug), unfiltered/filtered latency and filter tax all beat or tie both baselines. Load testing / hardening (auth, rate limiting) still ahead. See README section above. |
 | 6 | Usability — Docker, Python client, CLI | ✅ complete — all three verified on real hardware/live servers, not just written. 52 client-side tests (35 unit + 17 integration). See README section above. |
-| 7 | Hardening — auth, rate limiting, TLS, scoped anomaly detection | 🔶 in progress — auth + rate limiting + TLS all complete (82 Rust tests, 41 client-side tests, TLS via reverse proxy — the standard pattern, not built into the app). Anomaly detection still ahead. See README section above. |
+| 7 | Hardening — auth, rate limiting, TLS, scoped anomaly detection | 🔶 in progress — auth + rate limiting + TLS all complete and verified live on real hardware (two real bugs found and fixed during TLS verification: a silently-failing healthcheck, and a Compose list-merge gotcha). 82 Rust tests, 41 client-side tests. Anomaly detection still ahead. See README section above. |
 
 ## Reducing benchmark noise on Windows
 
@@ -701,7 +701,10 @@ default) behaves exactly as before with zero rate limiting anywhere.
 The Python client and CLI got a matching `RateLimitError` exception in
 the same pass (41 client-side tests now).
 
-**TLS — done, via reverse proxy, not built into the Rust server.**
+**TLS — done, via reverse proxy, not built into the Rust server.
+Fully verified on real hardware, including a real bug found and fixed
+along the way.**
+
 Deliberately not implemented as raw TLS termination inside axum
 (`axum-server` + `rustls` would work, but duplicates what a reverse
 proxy already does well, and adds real certificate-management
@@ -724,14 +727,25 @@ locally-trusted certificate via its own internal CA — no public domain
 or manual cert generation needed for local testing. Swap `localhost`
 for a real domain name and add an email address for a real, automatically-
 renewing Let's Encrypt certificate in production — the Caddyfile shows
-both forms. The overlay also removes the server's direct host port
-(`ports: []`) so the plain-HTTP port isn't reachable in parallel with
-the TLS one, bypassing it entirely — Caddy reaches the server over the
-internal Docker network by service name regardless.
+both forms.
 
-**Not build-tested against a real Docker daemon** — same honest caveat
-as the original Dockerfile before it was verified; this sandbox has no
-Docker available. Flag anything that doesn't work as written.
+**Two real bugs found and fixed during verification, not hidden:**
+1. The Docker healthcheck (`curl -f http://localhost:8080/health`, run
+   *inside* the container) had been silently failing since Phase 6 —
+   `curl` was never actually installed in the minimal runtime image.
+   Nothing depended on the healthcheck's actual pass/fail status until
+   this TLS overlay's `depends_on: condition: service_healthy` finally
+   checked it. Fixed by adding `curl` to the runtime image.
+2. The overlay's `ports: []`, meant to remove the server's direct host
+   port once Caddy is terminating TLS in front, silently did nothing —
+   Docker Compose merges list-type fields like `ports` across override
+   files by default, it doesn't replace them, so an empty list merged
+   into the base file's `["8080:8080"]` had no effect. Fixed with the
+   `!reset` YAML tag, which explicitly clears a merged list instead of
+   appending to it. Confirmed live: after the fix, `curl https://localhost/health`
+   still returns `ok` through Caddy, while the direct port is genuinely
+   gone from the container (`docker compose ps` shows `8080/tcp` with
+   no host-side `0.0.0.0:8080->` mapping at all).
 
 **Still ahead in this phase:** the scoped, statistical version of
 query-pattern anomaly detection discussed earlier in this project's
