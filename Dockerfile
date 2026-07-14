@@ -21,8 +21,16 @@ RUN cargo build --release --bin server
 FROM debian:bookworm-slim
 WORKDIR /app
 
+# curl is required by docker-compose.yml's healthcheck, which runs
+# `curl -f http://localhost:8080/health` FROM INSIDE this container --
+# not just from the host. Missing here for a while without anyone
+# noticing, because nothing previously depended on the healthcheck's
+# actual pass/fail status; docker-compose.tls.yml's Caddy service
+# (`depends_on: condition: service_healthy`) is what finally surfaced
+# this as a hard failure instead of a silent, ignored one.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/server /app/server
