@@ -182,6 +182,34 @@ def test_stats(capsys):
 
 
 @responses.activate
+def test_api_key_flag_sends_authorization_header(capsys):
+    responses.add(
+        responses.GET,
+        f"{BASE_URL}/v1/stats",
+        json={"live_records": 0, "memtable_records": 0, "sstable_count": 0, "index_built": False, "index_len": None},
+        status=200,
+    )
+    parser = build_parser()
+    args = parser.parse_args(["--url", BASE_URL, "--api-key", "my-secret-key", "stats"])
+    code = run(args)
+    assert code == 0
+    assert responses.calls[0].request.headers["Authorization"] == "Bearer my-secret-key"
+
+
+@responses.activate
+def test_missing_api_key_against_protected_server_prints_clear_error(capsys):
+    responses.add(
+        responses.GET,
+        f"{BASE_URL}/v1/stats",
+        json={"error": "missing or invalid API key -- pass one via 'Authorization: Bearer <key>'"},
+        status=401,
+    )
+    code, out, err = run_cli(["stats"], capsys)
+    assert code == 1
+    assert "API key" in err
+
+
+@responses.activate
 def test_insert_batch_from_file(capsys, tmp_path):
     responses.add(responses.POST, f"{BASE_URL}/v1/records/batch", status=201)
     batch_file = tmp_path / "records.json"

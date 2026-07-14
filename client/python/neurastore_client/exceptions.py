@@ -25,6 +25,19 @@ class NotFoundError(NeuraStoreError):
     """The requested record does not exist (HTTP 404)."""
 
 
+class AuthenticationError(NeuraStoreError):
+    """Missing or invalid API key (HTTP 401). Only possible if the
+    server was started with `NEURASTORE_API_KEYS` set -- pass the
+    correct key via `NeuraStoreClient(..., api_key=...)`."""
+
+
+class RateLimitError(NeuraStoreError):
+    """Too many requests (HTTP 429). Only possible if the server was
+    started with `NEURASTORE_RATE_LIMIT_RPS` set. Back off and retry
+    after a short delay -- the server's rate limiter refills
+    continuously, so this is a transient condition, not permanent."""
+
+
 class BadRequestError(NeuraStoreError):
     """The request was malformed or invalid per the server's own
     validation (HTTP 400) -- e.g. an empty vector, or querying before

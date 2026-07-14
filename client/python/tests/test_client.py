@@ -7,6 +7,7 @@ import pytest
 import responses
 
 from neurastore_client import (
+    AuthenticationError,
     BadRequestError,
     ConnectionError,
     NeuraStoreClient,
@@ -162,6 +163,52 @@ def test_server_error_raises_server_error(client):
     )
     with pytest.raises(ServerError, match="internal failure"):
         client.insert(1, [1.0])
+
+
+@responses.activate
+def test_client_sends_authorization_header_when_api_key_given():
+    with NeuraStoreClient(BASE_URL, api_key="my-secret-key") as authed_client:
+        responses.add(responses.GET, f"{BASE_URL}/v1/stats", json={
+            "live_records": 0, "memtable_records": 0, "sstable_count": 0,
+            "index_built": False, "index_len": None,
+        }, status=200)
+        authed_client.stats()
+        assert responses.calls[0].request.headers["Authorization"] == "Bearer my-secret-key"
+
+
+@responses.activate
+def test_client_sends_no_authorization_header_without_api_key(client):
+    responses.add(responses.GET, f"{BASE_URL}/v1/stats", json={
+        "live_records": 0, "memtable_records": 0, "sstable_count": 0,
+        "index_built": False, "index_len": None,
+    }, status=200)
+    client.stats()
+    assert "Authorization" not in responses.calls[0].request.headers
+
+
+@responses.activate
+def test_missing_or_wrong_api_key_raises_authentication_error(client):
+    responses.add(
+        responses.GET,
+        f"{BASE_URL}/v1/stats",
+        json={"error": "missing or invalid API key -- pass one via 'Authorization: Bearer <key>'"},
+        status=401,
+    )
+    with pytest.raises(AuthenticationError, match="API key"):
+        client.stats()
+
+
+@responses.activate
+def test_rate_limit_exceeded_raises_rate_limit_error(client):
+    from neurastore_client import RateLimitError
+    responses.add(
+        responses.GET,
+        f"{BASE_URL}/v1/stats",
+        json={"error": "rate limit exceeded -- slow down and try again shortly"},
+        status=429,
+    )
+    with pytest.raises(RateLimitError, match="rate limit"):
+        client.stats()
 
 
 def test_connection_error_when_server_unreachable():

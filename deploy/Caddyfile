@@ -1,0 +1,26 @@
+# Reverse proxy config for Caddy, terminating TLS in front of the
+# NeuraStore server -- see README.md's "TLS" section for why this is
+# the recommended pattern instead of building TLS into the Rust server
+# itself.
+#
+# For LOCAL TESTING (as-is): Caddy automatically issues a locally-
+# trusted certificate for "localhost" via its own internal CA -- no
+# public domain, no manual cert generation, no Let's Encrypt rate
+# limits to worry about. Your browser/client will trust it once Caddy's
+# internal root CA is trusted on your machine (Caddy prints
+# instructions for this on first run, or curl with -k to skip
+# verification for quick local testing).
+#
+# For a REAL DEPLOYMENT: replace "localhost" below with your actual
+# domain name (e.g. "neurastore.example.com") and add your email for
+# Let's Encrypt expiry notices. Caddy then automatically provisions and
+# renews a real, publicly-trusted certificate -- no other changes needed.
+#
+#   neurastore.example.com {
+#       tls you@example.com
+#       reverse_proxy neurastore:8080
+#   }
+
+localhost {
+	reverse_proxy neurastore:8080
+}

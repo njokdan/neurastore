@@ -520,6 +520,7 @@ performance problem, because it didn't need to.
 | 4 | Query fusion — push structured filters into HNSW traversal instead of overfetch-then-filter. **Target: match pgvector's ~2.8ms unfiltered p50 while keeping Milvus's ~1.1x (near-zero) filter tax instead of pgvector's ~2.6x.** | ✅ complete, confirmed on real hardware — **all 3 selectivities beat pgvector's 2.6x tax decisively** (1.50x median, 0.52x, 0.22x), 2 of 3 beat Milvus's 1.1x outright. Hardest case improved from 4.43x to 1.50x median across three root-caused optimization rounds, including one (chunking) correctly identified and reverted after real measurement showed it didn't help. See README section above. |
 | 5 | Interface & hardening — gRPC/HTTP API, load testing, benchmark report | ✅ HTTP/JSON API complete — 67 tests total (55 lib + 12 server). **Full fair client-server comparison done, every metric a real win or tie**: insert 15,649-17,927 vec/sec (9-11x pgvector, after finding and fixing a test methodology bug), unfiltered/filtered latency and filter tax all beat or tie both baselines. Load testing / hardening (auth, rate limiting) still ahead. See README section above. |
 | 6 | Usability — Docker, Python client, CLI | ✅ complete — all three verified on real hardware/live servers, not just written. 52 client-side tests (35 unit + 17 integration). See README section above. |
+| 7 | Hardening — auth, rate limiting, TLS, scoped anomaly detection | 🔶 in progress — auth + rate limiting + TLS all complete (82 Rust tests, 41 client-side tests, TLS via reverse proxy — the standard pattern, not built into the app). Anomaly detection still ahead. See README section above. |
 
 ## Reducing benchmark noise on Windows
 
@@ -620,6 +621,121 @@ suites), on top of the 67 Rust tests from Phases 0-5. Every documented
 example in this phase — the Python quickstart, every CLI command, the
 Docker persistence cycle — was actually run against a real server, not
 just written and assumed to work.
+
+## Status: Phase 7 — Hardening (in progress)
+
+Right now the server has zero protection — anyone who can reach it over
+the network has full read/write/delete access to everything. This phase
+starts closing that, one real, tested piece at a time.
+
+**API key authentication — done, verified live, backward compatible.**
+Opt-in via `NEURASTORE_API_KEYS` (comma-separated) at server startup:
+
+```bash
+NEURASTORE_API_KEYS=my-secret-key,another-clients-key cargo run --release --bin server -- ./data 8080
+```
+
+With no keys configured (the default), the server runs exactly as
+before — every existing example in this README still works with zero
+changes. This is an explicit choice, not a silent gap: the server logs
+a clear warning either way at startup, so running without auth is
+something you can see you did, not something you discover later.
+
+With keys configured, every `/v1/*` endpoint requires
+`Authorization: Bearer <key>`. `/health` is deliberately exempt even
+when auth is enabled — load balancers and orchestration health probes
+need to reach it without credentials. Multiple keys can be configured
+at once (one per client), so revoking one client's access doesn't
+affect others.
+
+8 new server-side tests (75 Rust tests total: 55 lib + 20 server),
+covering: health bypasses auth, missing/wrong/correct keys, multiple
+independent keys, write routes protected (not just reads), a malformed
+`Authorization` header failing cleanly (401, not a 500), and the
+no-keys-configured backward-compatibility case. Verified against real
+running servers with real `curl` requests, both with and without auth
+enabled, not just the in-process test harness.
+
+**The Python client and CLI were updated in the same pass, not left
+behind** — an auth-enabled server would otherwise be completely
+unreachable from the tooling built in Phase 6:
+
+```python
+client = NeuraStoreClient("http://localhost:8080", api_key="my-secret-key")
+```
+```bash
+export NEURASTORE_API_KEY=my-secret-key
+neurastore stats
+```
+
+A new `AuthenticationError` exception joins the client's existing error
+hierarchy. 6 new client-side tests (40 unit total, plus integration
+tests across the client and CLI), plus a full real-world run — actual
+CLI binary, actual live auth-enabled server — confirming the whole
+chain works together, not just each piece in isolation.
+
+**Rate limiting — done, verified live, a real design subtlety worth
+knowing about.** Opt-in via `NEURASTORE_RATE_LIMIT_RPS` (requests per
+second; `NEURASTORE_RATE_LIMIT_BURST` optionally overrides the default
+burst of 2x the rate). Standard token-bucket algorithm, one bucket per
+API key when auth is enabled, or one shared server-wide bucket when it
+isn't (there's no cheap per-client identity without auth — a documented
+simplification, not a silent gap).
+
+The subtlety: auth and rate limiting are deliberately implemented as
+**one combined check, not two independent middleware layers**. Two
+layers would need rate limiting to see auth's *validated* result, not
+just the raw header — keying limits by the raw provided key would let
+an attacker bypass the limiter entirely by rotating the key string on
+every request, since each new string gets a fresh bucket. Resolving
+identity once, before either check runs, closes that gap and avoids
+depending on tower's exact layer-ordering semantics being right.
+
+7 new server tests (82 Rust tests total: 55 lib + 27 server) — including
+one specifically checking that wrong-key requests always get a
+consistent 401, never a mix of 401/429 that could leak bucket state to
+an attacker. Verified live: burst limits enforced correctly, `/health`
+never throttled, buckets refill correctly over time, and disabled (the
+default) behaves exactly as before with zero rate limiting anywhere.
+
+The Python client and CLI got a matching `RateLimitError` exception in
+the same pass (41 client-side tests now).
+
+**TLS — done, via reverse proxy, not built into the Rust server.**
+Deliberately not implemented as raw TLS termination inside axum
+(`axum-server` + `rustls` would work, but duplicates what a reverse
+proxy already does well, and adds real certificate-management
+complexity to the app itself). Almost no production axum deployment
+actually terminates TLS in-process — this follows that same standard
+pattern instead of inventing a different one.
+
+`deploy/Caddyfile` + `docker-compose.tls.yml` (an overlay on the base
+`docker-compose.yml`, not a replacement) add
+[Caddy](https://caddyserver.com/) as a TLS-terminating reverse proxy in
+front of the server:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.tls.yml up --build
+```
+
+The same two-line Caddy config handles both cases with zero code
+changes: as shipped (`localhost`), Caddy automatically issues a
+locally-trusted certificate via its own internal CA — no public domain
+or manual cert generation needed for local testing. Swap `localhost`
+for a real domain name and add an email address for a real, automatically-
+renewing Let's Encrypt certificate in production — the Caddyfile shows
+both forms. The overlay also removes the server's direct host port
+(`ports: []`) so the plain-HTTP port isn't reachable in parallel with
+the TLS one, bypassing it entirely — Caddy reaches the server over the
+internal Docker network by service name regardless.
+
+**Not build-tested against a real Docker daemon** — same honest caveat
+as the original Dockerfile before it was verified; this sandbox has no
+Docker available. Flag anything that doesn't work as written.
+
+**Still ahead in this phase:** the scoped, statistical version of
+query-pattern anomaly detection discussed earlier in this project's
+planning.
 
 ## Deliberately out of scope for now
 

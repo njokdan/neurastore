@@ -24,7 +24,14 @@ from typing import Dict, List, Optional, Sequence
 
 import requests
 
-from .exceptions import BadRequestError, ConnectionError, NotFoundError, ServerError
+from .exceptions import (
+    AuthenticationError,
+    BadRequestError,
+    ConnectionError,
+    NotFoundError,
+    RateLimitError,
+    ServerError,
+)
 from .models import Record, SearchResult, Stats
 
 _BINARY_MAGIC = b"NSBB"
@@ -45,10 +52,22 @@ class NeuraStoreClient:
         ...     client.insert(1, [0.1, 0.2, 0.3])
     """
 
-    def __init__(self, base_url: str = "http://localhost:8080", timeout: float = 30.0):
+    def __init__(
+        self,
+        base_url: str = "http://localhost:8080",
+        timeout: float = 30.0,
+        api_key: Optional[str] = None,
+    ):
+        """`api_key`, if given, is sent as `Authorization: Bearer <api_key>`
+        on every request. Only needed if the server was started with
+        `NEURASTORE_API_KEYS` set -- a server with no keys configured
+        (the default) ignores this header entirely, so passing `api_key`
+        against an unprotected server is harmless, not an error."""
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self._session = requests.Session()
+        if api_key:
+            self._session.headers["Authorization"] = f"Bearer {api_key}"
 
     def __enter__(self) -> "NeuraStoreClient":
         return self
@@ -65,6 +84,10 @@ class NeuraStoreClient:
     def _handle_response(self, response: requests.Response) -> requests.Response:
         if response.status_code == 404:
             raise NotFoundError(_error_message(response))
+        if response.status_code == 401:
+            raise AuthenticationError(_error_message(response))
+        if response.status_code == 429:
+            raise RateLimitError(_error_message(response))
         if response.status_code == 400:
             raise BadRequestError(_error_message(response))
         if response.status_code >= 500:

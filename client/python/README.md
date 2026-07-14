@@ -78,6 +78,51 @@ Exception hierarchy:
 This client only depends on `requests` — no numpy required. Pass any
 sequence of numbers (`list`, `tuple`, or a numpy array via `.tolist()`).
 
+## Authentication
+
+If the server was started with `NEURASTORE_API_KEYS` set (see the main
+repo's README), every request needs a valid key. Pass it when
+constructing the client:
+
+```python
+client = NeuraStoreClient("http://localhost:8080", api_key="my-secret-key")
+```
+
+A server with no keys configured (the default) ignores this entirely —
+passing `api_key` against an unprotected server is harmless. Missing or
+wrong keys raise `AuthenticationError`.
+
+The CLI reads the key from `--api-key` or the `NEURASTORE_API_KEY`
+environment variable:
+
+```bash
+export NEURASTORE_API_KEY=my-secret-key
+neurastore stats
+```
+
+## Rate limiting
+
+If the server was started with `NEURASTORE_RATE_LIMIT_RPS` set, the
+client raises `RateLimitError` (HTTP 429) when the limit is hit. The
+server's limiter refills continuously, so this is transient — back off
+and retry:
+
+```python
+from neurastore_client import RateLimitError
+import time
+
+try:
+    client.insert(1, [0.1, 0.2, 0.3])
+except RateLimitError:
+    time.sleep(1)
+    client.insert(1, [0.1, 0.2, 0.3])
+```
+
+With API key auth also enabled, each key gets its own independent
+rate-limit bucket. Without auth, all clients share one server-wide
+bucket (there's no per-client identity to key on without a key) — see
+the main repo's README for that documented tradeoff.
+
 ## CLI
 
 Installing the package also installs a `neurastore` command:

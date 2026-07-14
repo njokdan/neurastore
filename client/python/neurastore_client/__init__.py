@@ -17,10 +17,12 @@ exceptions by name.
 """
 from .client import NeuraStoreClient
 from .exceptions import (
+    AuthenticationError,
     BadRequestError,
     ConnectionError,
     NeuraStoreError,
     NotFoundError,
+    RateLimitError,
     ServerError,
 )
 from .models import Record, SearchResult, Stats
@@ -32,6 +34,8 @@ __all__ = [
     "NeuraStoreError",
     "ConnectionError",
     "NotFoundError",
+    "AuthenticationError",
+    "RateLimitError",
     "BadRequestError",
     "ServerError",
     "Record",

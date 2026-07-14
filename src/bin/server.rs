@@ -24,8 +24,9 @@
 
 use axum::{
     body::Bytes,
-    extract::{Path, State},
-    http::StatusCode,
+    extract::{Path, Request, State},
+    http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Json},
     routing::{delete, get, post},
     Router,
@@ -33,12 +34,21 @@ use axum::{
 use neurastore::record::RecordId;
 use neurastore::Engine;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::sync::RwLock;
 
 type SharedEngine = Arc<RwLock<Engine>>;
+
+/// `None` means auth is disabled (no keys configured at startup -- the
+/// local/dev default, so `cargo run` keeps working with zero setup).
+/// `Some(keys)` means every protected request must present one of these
+/// keys via `Authorization: Bearer <key>`. `/health` is never protected,
+/// even when auth is enabled -- load balancers and orchestration health
+/// probes need to reach it without credentials.
+type ApiKeys = Arc<Option<HashSet<String>>>;
 
 // ---------------------------------------------------------------------
 // Request/response types
@@ -124,6 +134,8 @@ enum ApiError {
     NotFound,
     BadRequest(String),
     Internal(String),
+    Unauthorized,
+    TooManyRequests,
 }
 
 impl IntoResponse for ApiError {
@@ -132,9 +144,105 @@ impl IntoResponse for ApiError {
             ApiError::NotFound => (StatusCode::NOT_FOUND, "record not found".to_string()),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+            ApiError::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                "missing or invalid API key -- pass one via 'Authorization: Bearer <key>'".to_string(),
+            ),
+            ApiError::TooManyRequests => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate limit exceeded -- slow down and try again shortly".to_string(),
+            ),
         };
         (status, Json(ErrorResponse { error: message })).into_response()
     }
+}
+
+/// Token-bucket rate limiter, one bucket per client identity. Refills
+/// continuously at `rate_per_sec`, capped at `burst` -- standard token
+/// bucket semantics: burst allows short spikes, the steady rate is what
+/// actually gets enforced over time.
+///
+/// Uses a plain `std::sync::Mutex`, not `tokio::sync::Mutex` -- the
+/// critical section here is pure arithmetic (no `.await` held across
+/// the lock), so a blocking mutex is the right, simpler choice; an
+/// async mutex would add overhead for no benefit in this specific case.
+struct RateLimiter {
+    buckets: Mutex<HashMap<String, (f64, Instant)>>, // key -> (tokens, last_refill)
+    rate_per_sec: f64,
+    burst: f64,
+}
+
+impl RateLimiter {
+    fn new(rate_per_sec: f64, burst: f64) -> Self {
+        Self { buckets: Mutex::new(HashMap::new()), rate_per_sec, burst }
+    }
+
+    /// Returns true if the request is allowed (and consumes one token),
+    /// false if the caller should be rejected with 429.
+    fn check(&self, identity: &str) -> bool {
+        let mut buckets = self.buckets.lock().expect("rate limiter mutex poisoned");
+        let now = Instant::now();
+        let (tokens, last_refill) = buckets.entry(identity.to_string()).or_insert((self.burst, now));
+        let elapsed = now.duration_since(*last_refill).as_secs_f64();
+        *tokens = (*tokens + elapsed * self.rate_per_sec).min(self.burst);
+        *last_refill = now;
+        if *tokens >= 1.0 {
+            *tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SecurityConfig {
+    api_keys: ApiKeys,
+    rate_limiter: Option<Arc<RateLimiter>>,
+}
+
+/// Combines auth and rate-limiting into one pass, deliberately not two
+/// separate middleware layers. Two layers would need rate-limiting to
+/// somehow see auth's *validated* result (not just the raw, possibly
+/// forged header) to avoid a real gap: keying rate limits by the raw
+/// provided key would let an attacker bypass limits entirely by simply
+/// rotating the key string on every request, since each new string gets
+/// a fresh bucket. Resolving identity once, in one function, before
+/// either check runs, avoids that gap and avoids relying on tower's
+/// layer-ordering semantics being exactly right.
+///
+/// When auth is disabled (no keys configured), every client shares one
+/// global rate-limit bucket -- there's no cheap, reliable per-client
+/// identity available without auth (that would need extracting and
+/// trusting a connection's source IP, a bigger change deferred for
+/// now). Documented as a known simplification, not silently assumed.
+async fn security_middleware(
+    State(config): State<SecurityConfig>,
+    headers: HeaderMap,
+    request: Request,
+    next: Next,
+) -> Result<axum::response::Response, ApiError> {
+    let identity: String = match config.api_keys.as_ref() {
+        Some(valid_keys) => {
+            let provided_key = headers
+                .get("Authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "));
+            match provided_key {
+                Some(key) if valid_keys.contains(key) => key.to_string(),
+                _ => return Err(ApiError::Unauthorized),
+            }
+        }
+        None => "__anonymous_shared_bucket__".to_string(),
+    };
+
+    if let Some(limiter) = &config.rate_limiter {
+        if !limiter.check(&identity) {
+            return Err(ApiError::TooManyRequests);
+        }
+    }
+
+    Ok(next.run(request).await)
 }
 
 // ---------------------------------------------------------------------
@@ -354,9 +462,8 @@ async fn stats(State(engine): State<SharedEngine>) -> Json<StatsResponse> {
     })
 }
 
-fn build_router(engine: SharedEngine) -> Router {
-    Router::new()
-        .route("/health", get(health))
+fn build_router(engine: SharedEngine, security: SecurityConfig) -> Router {
+    let protected = Router::new()
         .route("/v1/records", post(put_record))
         .route("/v1/records/batch", post(put_batch))
         .route("/v1/records/batch/binary", post(put_batch_binary))
@@ -366,7 +473,18 @@ fn build_router(engine: SharedEngine) -> Router {
         .route("/v1/search", post(search))
         .route("/v1/search/filtered", post(search_filtered))
         .route("/v1/stats", get(stats))
+        // route_layer applies only to the routes already added above,
+        // and only to requests that match one of them -- unmatched
+        // paths fall through to a 404 without ever running this check.
+        // security_middleware's state (SecurityConfig) is independent
+        // of the router's own handler state (SharedEngine) below.
+        .route_layer(middleware::from_fn_with_state(security, security_middleware))
+        .with_state(engine.clone());
+
+    Router::new()
+        .route("/health", get(health))
         .with_state(engine)
+        .merge(protected)
         // axum applies a 2MB default request body limit. A batch of
         // 1,000 records at dim=128 (JSON floats, ~1.5-2KB/record) sits
         // right at that ceiling -- real-world batch inserts of
@@ -374,8 +492,7 @@ fn build_router(engine: SharedEngine) -> Router {
         // routinely. Raised to 50MB, generous enough for large batches
         // at typical embedding dimensions (up to ~1536 for common
         // OpenAI-style embeddings) without removing the safety limit
-        // entirely (unbounded body size is a real DoS vector -- worth
-        // keeping in mind once Phase 6's hardening work happens).
+        // entirely (unbounded body size is a real DoS vector).
         .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024))
 }
 
@@ -389,7 +506,57 @@ async fn main() {
     println!("NeuraStore server -- data dir: {data_dir}");
     let shared: SharedEngine = Arc::new(RwLock::new(engine));
 
-    let app = build_router(shared);
+    // Auth is opt-in via NEURASTORE_API_KEYS (comma-separated keys),
+    // not opt-out -- but the startup log makes the choice visible either
+    // way, so running without auth is a decision someone can see they
+    // made, not a silent gap they discover later.
+    let api_keys: ApiKeys = match env::var("NEURASTORE_API_KEYS") {
+        Ok(raw) => {
+            let keys: HashSet<String> = raw.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            if keys.is_empty() {
+                println!("WARNING: NEURASTORE_API_KEYS was set but contained no valid keys -- running WITHOUT authentication.");
+                Arc::new(None)
+            } else {
+                println!("Authentication ENABLED -- {} API key(s) configured. All /v1/* endpoints require 'Authorization: Bearer <key>'.", keys.len());
+                Arc::new(Some(keys))
+            }
+        }
+        Err(_) => {
+            println!("WARNING: NEURASTORE_API_KEYS not set -- running WITHOUT authentication. Anyone who can reach this server has full read/write access. Set NEURASTORE_API_KEYS to a comma-separated list of keys to enable it.");
+            Arc::new(None)
+        }
+    };
+
+    // Rate limiting is opt-in too, same reasoning as auth: this
+    // project's own benchmark tooling fires many rapid requests, and a
+    // default-on limit could silently break documented workflows.
+    // NEURASTORE_RATE_LIMIT_RPS=<n> enables it; burst defaults to 2x the
+    // rate (a couple seconds' worth of headroom for legitimate bursts)
+    // unless NEURASTORE_RATE_LIMIT_BURST overrides it.
+    let rate_limiter: Option<Arc<RateLimiter>> = match env::var("NEURASTORE_RATE_LIMIT_RPS") {
+        Ok(raw) => match raw.parse::<f64>() {
+            Ok(rps) if rps > 0.0 => {
+                let burst: f64 = env::var("NEURASTORE_RATE_LIMIT_BURST")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(rps * 2.0);
+                println!("Rate limiting ENABLED -- {rps} req/sec, burst {burst}, per {}.", 
+                    if env::var("NEURASTORE_API_KEYS").is_ok() { "API key" } else { "server-wide (no auth configured, so no per-client identity)" });
+                Some(Arc::new(RateLimiter::new(rps, burst)))
+            }
+            _ => {
+                println!("WARNING: NEURASTORE_RATE_LIMIT_RPS was set but isn't a valid positive number -- rate limiting disabled.");
+                None
+            }
+        },
+        Err(_) => {
+            println!("Rate limiting disabled. Set NEURASTORE_RATE_LIMIT_RPS=<requests/sec> to enable it.");
+            None
+        }
+    };
+
+    let security = SecurityConfig { api_keys, rate_limiter };
+    let app = build_router(shared, security);
     let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("failed to bind");
     println!("Listening on http://{addr}");
@@ -431,7 +598,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_check_returns_ok() {
-        let app = build_router(test_engine());
+        let app = build_router(test_engine(), no_security());
         let response = app
             .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
             .await
@@ -441,7 +608,7 @@ mod tests {
 
     #[tokio::test]
     async fn put_then_get_roundtrip() {
-        let app = build_router(test_engine());
+        let app = build_router(test_engine(), no_security());
 
         let put_body = serde_json::json!({
             "id": 1,
@@ -475,7 +642,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_nonexistent_record_returns_404() {
-        let app = build_router(test_engine());
+        let app = build_router(test_engine(), no_security());
         let response = app
             .oneshot(Request::builder().uri("/v1/records/999").body(Body::empty()).unwrap())
             .await
@@ -485,7 +652,7 @@ mod tests {
 
     #[tokio::test]
     async fn put_with_empty_vector_returns_400() {
-        let app = build_router(test_engine());
+        let app = build_router(test_engine(), no_security());
         let put_body = serde_json::json!({"id": 1, "vector": []});
         let response = app
             .oneshot(
@@ -503,7 +670,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_then_get_returns_404() {
-        let app = build_router(test_engine());
+        let app = build_router(test_engine(), no_security());
 
         let put_body = serde_json::json!({"id": 5, "vector": [1.0, 1.0]});
         app.clone()
@@ -534,7 +701,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_without_index_returns_400() {
-        let app = build_router(test_engine());
+        let app = build_router(test_engine(), no_security());
         let search_body = serde_json::json!({"vector": [1.0, 2.0], "k": 5});
         let response = app
             .oneshot(
@@ -552,7 +719,7 @@ mod tests {
 
     #[tokio::test]
     async fn put_batch_build_index_and_search_end_to_end() {
-        let app = build_router(test_engine());
+        let app = build_router(test_engine(), no_security());
 
         let batch_body = serde_json::json!({
             "records": [
@@ -645,7 +812,7 @@ mod tests {
 
     #[tokio::test]
     async fn binary_batch_insert_then_get_roundtrip() {
-        let app = build_router(test_engine());
+        let app = build_router(test_engine(), no_security());
         let body = encode_binary_batch(&[
             (1, vec![1.0, 2.0, 3.0], r#"{"category":"docs"}"#),
             (2, vec![4.0, 5.0, 6.0], r#"{"category":"code"}"#),
@@ -681,7 +848,7 @@ mod tests {
         // binary endpoint must be indistinguishable from data loaded via
         // the JSON endpoint -- same engine, same VectorIndex underneath,
         // this only changes how bytes cross the wire.
-        let app = build_router(test_engine());
+        let app = build_router(test_engine(), no_security());
         let body = encode_binary_batch(&[
             (1, vec![0.0, 0.0], r#"{"category":"docs"}"#),
             (2, vec![10.0, 10.0], r#"{"category":"code"}"#),
@@ -726,7 +893,7 @@ mod tests {
 
     #[tokio::test]
     async fn binary_batch_insert_rejects_bad_magic() {
-        let app = build_router(test_engine());
+        let app = build_router(test_engine(), no_security());
         let mut body = encode_binary_batch(&[(1, vec![1.0], r#"{}"#)]);
         body[0] = b'X'; // corrupt the magic bytes
         let response = app
@@ -745,7 +912,7 @@ mod tests {
 
     #[tokio::test]
     async fn binary_batch_insert_rejects_truncated_payload() {
-        let app = build_router(test_engine());
+        let app = build_router(test_engine(), no_security());
         let mut body = encode_binary_batch(&[(1, vec![1.0, 2.0, 3.0], r#"{"category":"docs"}"#)]);
         body.truncate(body.len() - 5); // chop off the tail
         let response = app
@@ -764,7 +931,7 @@ mod tests {
 
     #[tokio::test]
     async fn stats_reflects_engine_state() {
-        let app = build_router(test_engine());
+        let app = build_router(test_engine(), no_security());
         let put_body = serde_json::json!({"id": 1, "vector": [1.0]});
         app.clone()
             .oneshot(
@@ -783,5 +950,286 @@ mod tests {
         let json = body_json(response).await;
         assert_eq!(json["live_records"], 1);
         assert_eq!(json["index_built"], false);
+    }
+
+    fn api_keys(keys: &[&str]) -> ApiKeys {
+        Arc::new(Some(keys.iter().map(|k| k.to_string()).collect()))
+    }
+
+    fn no_security() -> SecurityConfig {
+        SecurityConfig { api_keys: Arc::new(None), rate_limiter: None }
+    }
+
+    fn security_with_keys(keys: &[&str]) -> SecurityConfig {
+        SecurityConfig { api_keys: api_keys(keys), rate_limiter: None }
+    }
+
+    #[tokio::test]
+    async fn health_check_bypasses_auth_even_when_enabled() {
+        let app = build_router(test_engine(), security_with_keys(&["secret123"]));
+        // No Authorization header at all -- /health must still work.
+        let response = app
+            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn protected_route_without_key_returns_401_when_auth_enabled() {
+        let app = build_router(test_engine(), security_with_keys(&["secret123"]));
+        let response = app
+            .oneshot(Request::builder().uri("/v1/stats").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn protected_route_with_wrong_key_returns_401() {
+        let app = build_router(test_engine(), security_with_keys(&["secret123"]));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/stats")
+                    .header("Authorization", "Bearer wrong-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn protected_route_with_correct_key_succeeds() {
+        let app = build_router(test_engine(), security_with_keys(&["secret123"]));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/stats")
+                    .header("Authorization", "Bearer secret123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn multiple_configured_keys_each_work_independently() {
+        let app = build_router(test_engine(), security_with_keys(&["key-for-client-a", "key-for-client-b"]));
+
+        for key in ["key-for-client-a", "key-for-client-b"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/v1/stats")
+                        .header("Authorization", format!("Bearer {key}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "key {key} should be accepted");
+        }
+    }
+
+    #[tokio::test]
+    async fn no_keys_configured_means_auth_disabled_backward_compatible() {
+        // The Phase 5/6 default: Arc::new(None) means every existing
+        // client (no Authorization header at all) keeps working exactly
+        // as before auth was added.
+        let app = build_router(test_engine(), no_security());
+        let response = app
+            .oneshot(Request::builder().uri("/v1/stats").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_applies_to_write_routes_not_just_reads() {
+        let app = build_router(test_engine(), security_with_keys(&["secret123"]));
+        let put_body = serde_json::json!({"id": 1, "vector": [1.0]});
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/records")
+                    .header("content-type", "application/json")
+                    // deliberately no Authorization header
+                    .body(Body::from(put_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn malformed_authorization_header_returns_401_not_500() {
+        let app = build_router(test_engine(), security_with_keys(&["secret123"]));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/stats")
+                    // missing the "Bearer " prefix entirely
+                    .header("Authorization", "secret123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    fn security_with_rate_limit(keys: Option<&[&str]>, rate_per_sec: f64, burst: f64) -> SecurityConfig {
+        SecurityConfig {
+            api_keys: match keys {
+                Some(k) => api_keys(k),
+                None => Arc::new(None),
+            },
+            rate_limiter: Some(Arc::new(RateLimiter::new(rate_per_sec, burst))),
+        }
+    }
+
+    #[tokio::test]
+    async fn requests_within_burst_all_succeed() {
+        let app = build_router(test_engine(), security_with_rate_limit(Some(&["k1"]), 1.0, 3.0));
+        for _ in 0..3 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/v1/stats")
+                        .header("Authorization", "Bearer k1")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn requests_beyond_burst_get_429() {
+        let app = build_router(test_engine(), security_with_rate_limit(Some(&["k1"]), 1.0, 2.0));
+        let make_request = || {
+            Request::builder()
+                .uri("/v1/stats")
+                .header("Authorization", "Bearer k1")
+                .body(Body::empty())
+                .unwrap()
+        };
+        // Burst of 2 -- first two succeed immediately.
+        for _ in 0..2 {
+            let response = app.clone().oneshot(make_request()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        // Third request in immediate succession (no time for refill at
+        // 1/sec) should be rejected.
+        let response = app.clone().oneshot(make_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn different_api_keys_get_independent_rate_limit_buckets() {
+        let app = build_router(
+            test_engine(),
+            security_with_rate_limit(Some(&["client-a", "client-b"]), 1.0, 1.0),
+        );
+        let request_with_key = |key: &str| {
+            Request::builder()
+                .uri("/v1/stats")
+                .header("Authorization", format!("Bearer {key}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        // Exhaust client-a's single-token burst.
+        let r1 = app.clone().oneshot(request_with_key("client-a")).await.unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+        let r2 = app.clone().oneshot(request_with_key("client-a")).await.unwrap();
+        assert_eq!(r2.status(), StatusCode::TOO_MANY_REQUESTS, "client-a should be rate-limited now");
+
+        // client-b has its own separate bucket, untouched by client-a's usage.
+        let r3 = app.clone().oneshot(request_with_key("client-b")).await.unwrap();
+        assert_eq!(r3.status(), StatusCode::OK, "client-b should have its own independent bucket");
+    }
+
+    #[tokio::test]
+    async fn wrong_key_returns_401_not_429_even_when_rate_limited() {
+        // Confirms the ordering guarantee this design was specifically
+        // built around: identity is resolved (and auth checked) BEFORE
+        // the rate limiter ever sees a key, so an attacker rotating
+        // through wrong keys gets consistent 401s, not a mix of 401/429
+        // that could leak information about bucket state.
+        let app = build_router(test_engine(), security_with_rate_limit(Some(&["real-key"]), 1.0, 1.0));
+        for _ in 0..5 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/v1/stats")
+                        .header("Authorization", "Bearer totally-wrong-key")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[tokio::test]
+    async fn health_check_bypasses_rate_limiting_too() {
+        let app = build_router(test_engine(), security_with_rate_limit(None, 1.0, 1.0));
+        // Fire many more health checks than the burst would allow for
+        // a protected route -- health must never be throttled.
+        for _ in 0..10 {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn no_auth_configured_shares_one_global_bucket() {
+        // Documented, intentional simplification: without auth, there's
+        // no per-client identity to key on, so everyone shares one
+        // bucket. This test exists to make that behavior explicit and
+        // guarded, not just described in a comment.
+        let app = build_router(test_engine(), security_with_rate_limit(None, 1.0, 1.0));
+        let r1 = app
+            .clone()
+            .oneshot(Request::builder().uri("/v1/stats").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+        let r2 = app
+            .clone()
+            .oneshot(Request::builder().uri("/v1/stats").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::TOO_MANY_REQUESTS, "second anonymous request should share the same exhausted bucket");
+    }
+
+    #[tokio::test]
+    async fn rate_limiting_disabled_by_default_matches_prior_behavior() {
+        let app = build_router(test_engine(), no_security());
+        for _ in 0..20 {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri("/v1/stats").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "no rate limiter configured -- nothing should ever 429");
+        }
     }
 }

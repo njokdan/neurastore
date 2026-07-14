@@ -70,6 +70,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("NEURASTORE_URL", DEFAULT_URL),
         help=f"server URL (default: {DEFAULT_URL}, or $NEURASTORE_URL)",
     )
+    parser.add_argument(
+        "--api-key",
+        default=os.environ.get("NEURASTORE_API_KEY"),
+        help="API key, if the server has authentication enabled (default: $NEURASTORE_API_KEY)",
+    )
     parser.add_argument("--json", action="store_true", help="output machine-readable JSON instead of text")
 
     sub = parser.add_subparsers(dest="command", required=True)
@@ -123,7 +128,7 @@ def _load_batch_file(path: str) -> List[Dict]:
 
 
 def run(args: argparse.Namespace) -> int:
-    client = NeuraStoreClient(args.url)
+    client = NeuraStoreClient(args.url, api_key=args.api_key)
     try:
         if args.command == "health":
             ok = client.health()
