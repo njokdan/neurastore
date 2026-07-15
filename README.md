@@ -925,3 +925,26 @@ This is not trying to beat every database on every axis. The bet is
 narrow and specific: one engine for AI-native workloads that avoids the
 sync-lag and overfetch problems of bolting a vector index onto a
 general-purpose store.
+
+## License & contributing
+
+Apache 2.0 — see [`LICENSE`](./LICENSE). Chosen deliberately over a
+more restrictive license (SSPL/AGPL) because the project has no users
+yet: maximizing the odds that anyone tries it, contributes, or builds
+on it matters more right now than pre-emptively defending a business
+model that doesn't exist yet. Revisiting the license later, if a real
+commercial threat materializes, is a well-worn path (see `PORTFOLIO.md`
+for the fuller reasoning and the MongoDB/Elastic/Redis history behind
+that judgment).
+
+Contributions welcome — see [`CONTRIBUTING.md`](./CONTRIBUTING.md) for
+setup, testing expectations, and what a good PR looks like here.
+Security issues: see [`SECURITY.md`](./SECURITY.md) (please don't file
+these as public issues). Community standards: [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md).
+
+CI runs the full test suite (Rust + Python) on every push and PR —
+see [`.github/workflows/ci.yml`](./.github/workflows/ci.yml). Not yet
+verified against a real GitHub Actions run from this environment (no
+way to trigger one from here) — flag anything that doesn't work as
+written, same honest caveat as the original Dockerfile before it was
+verified.

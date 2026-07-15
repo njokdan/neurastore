@@ -1,0 +1,66 @@
+name: CI
+
+# Every test suite in this project has, up to this point, been verified
+# manually and reported back turn by turn. That was appropriate for an
+# interactive build process, but it's not a substitute for CI on a
+# public repository -- this workflow is what actually enforces "all
+# tests pass" from here on, on every push and PR, without relying on
+# someone remembering to run them.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  rust:
+    name: Rust (lib + server tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build (release -- matches how this project has always been benchmarked and tested)
+        run: cargo build --release --verbose
+
+      - name: Run library tests
+        run: cargo test --release --lib --verbose
+
+      - name: Run server tests
+        run: cargo test --release --bin server --verbose
+
+  python-client:
+    name: Python client + CLI tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install the client package with test dependencies
+        run: pip install -e "client/python[test]"
+
+      # test_integration.py needs a real running server and skips
+      # itself automatically when none is reachable -- CI intentionally
+      # doesn't start one here, so those tests are expected to be
+      # skipped, not failed. If they ever show as failed instead of
+      # skipped in CI output, that's worth investigating on its own.
+      - name: Run unit tests (HTTP mocked, no server needed)
+        run: pytest client/python/tests/test_client.py client/python/tests/test_cli.py -v

@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Python client for NeuraStore, a unified vector + structured-filter database engine"
 readme = "README.md"
 requires-python = ">=3.8"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 dependencies = [
     "requests>=2.31",
 ]
@@ -17,8 +17,8 @@ dependencies = [
 test = ["pytest>=7.0", "responses>=0.23"]
 
 [project.urls]
-Homepage = "https://github.com/your-username/neurastore"
-Repository = "https://github.com/your-username/neurastore"
+Homepage = "https://github.com/njokdan/neurastore"
+Repository = "https://github.com/njokdan/neurastore"
 
 [project.scripts]
 neurastore = "neurastore_client.cli:main"
