@@ -10,7 +10,10 @@ Sub-millisecond hybrid vector + structured-filter queries on live-writing
 data, benchmarked head-to-head against pgvector and Milvus.
 
 **See [`COMPARISON.md`](./COMPARISON.md) for the full, fairly-measured
-head-to-head — every number client-to-server, every claim reproducible.**
+head-to-head — every number client-to-server, every claim reproducible.
+See [`PORTFOLIO.md`](./PORTFOLIO.md) for the high-level summary: what
+this is, the numbers that matter, and the engineering story behind
+them.**
 
 ## Status: Phase 1 — Storage Engine Core (complete)
 
@@ -520,7 +523,8 @@ performance problem, because it didn't need to.
 | 4 | Query fusion — push structured filters into HNSW traversal instead of overfetch-then-filter. **Target: match pgvector's ~2.8ms unfiltered p50 while keeping Milvus's ~1.1x (near-zero) filter tax instead of pgvector's ~2.6x.** | ✅ complete, confirmed on real hardware — **all 3 selectivities beat pgvector's 2.6x tax decisively** (1.50x median, 0.52x, 0.22x), 2 of 3 beat Milvus's 1.1x outright. Hardest case improved from 4.43x to 1.50x median across three root-caused optimization rounds, including one (chunking) correctly identified and reverted after real measurement showed it didn't help. See README section above. |
 | 5 | Interface & hardening — gRPC/HTTP API, load testing, benchmark report | ✅ HTTP/JSON API complete — 67 tests total (55 lib + 12 server). **Full fair client-server comparison done, every metric a real win or tie**: insert 15,649-17,927 vec/sec (9-11x pgvector, after finding and fixing a test methodology bug), unfiltered/filtered latency and filter tax all beat or tie both baselines. Load testing / hardening (auth, rate limiting) still ahead. See README section above. |
 | 6 | Usability — Docker, Python client, CLI | ✅ complete — all three verified on real hardware/live servers, not just written. 52 client-side tests (35 unit + 17 integration). See README section above. |
-| 7 | Hardening — auth, rate limiting, TLS, scoped anomaly detection | 🔶 in progress — auth + rate limiting + TLS all complete and verified live on real hardware (two real bugs found and fixed during TLS verification: a silently-failing healthcheck, and a Compose list-merge gotcha). 82 Rust tests, 41 client-side tests. Anomaly detection still ahead. See README section above. |
+| 7 | Hardening — auth, rate limiting, TLS, scoped anomaly detection | ✅ complete — all four pieces verified live on real hardware. 88 Rust tests, 41 client-side tests. Four real bugs found and fixed during verification (a Docker healthcheck, a Compose merge-semantics gotcha, and two anomaly-detection statistical bugs), not assumed away. See README section above. |
+| 8 | Architectural gaps — multi-collection, tombstone compaction, maybe gRPC | 🔶 in progress — tombstone compaction AND multi-collection support both complete (105 Rust tests, verified live). Fully backward compatible -- zero migration for existing deployments. gRPC not yet justified by any concrete need. See README section above. |
 
 ## Reducing benchmark noise on Windows
 
@@ -747,9 +751,167 @@ both forms.
    gone from the container (`docker compose ps` shows `8080/tcp` with
    no host-side `0.0.0.0:8080->` mapping at all).
 
-**Still ahead in this phase:** the scoped, statistical version of
-query-pattern anomaly detection discussed earlier in this project's
-planning.
+**Anomaly detection — done, the scoped statistical version this project
+committed to, not the expansive "AI security" framing set aside during
+early planning. Two real bugs found via live testing, not just written
+and assumed correct.**
+
+Opt-in via `NEURASTORE_ANOMALY_DETECTION=1`. Tracks two exponentially-
+weighted moving averages of request rate per client identity (same
+concept as rate limiting's per-key buckets): a fast-reacting one and a
+slow, established-baseline one. When the fast average significantly
+exceeds the slow one — a real behavior change for *that specific
+client*, not a fixed global threshold — it's logged clearly for a human
+to review. **It never blocks a request.** A statistical detector will
+have false positives (a legitimate bulk load looks identical to a
+burst), and auto-rejecting on those would be worse than the problem
+it's meant to catch — the same human-in-the-loop principle applied to
+every security-adjacent decision in this project.
+
+Two real, distinct bugs surfaced during live verification, both found
+by noticing the reported numbers didn't make sense, not by assuming the
+code was correct because it compiled and passed synthetic unit tests:
+
+1. A brand-new client's very first request was being compared against
+   itself as its own "previous" timestamp, producing a near-zero
+   interval and an artificial ~1000/s rate spike baked permanently into
+   that client's baseline from the start. Fixed by skipping rate
+   estimation entirely on the first request — it only establishes a
+   starting point; real estimation begins from the second request,
+   where an actual interval exists between two real events.
+2. After fixing that, a *steady, non-anomalous* request pattern started
+   getting flagged anyway — a deterministic unit test
+   (`steady_rate_requests_never_flagged`) caught this immediately. Root
+   cause: the fast EWMA (which reacts quickly) and the slow EWMA (which
+   represents an established baseline) both started from zero but
+   converge at very different speeds, creating a persistent false
+   "fast ≫ slow" gap during a client's early requests under perfectly
+   normal load. Fixed by seeding both averages directly from the first
+   real observed interval instead of both crawling up from a shared
+   zero at mismatched rates.
+
+10 new server tests (88 Rust tests total: 55 lib + 33 server), including
+four testing the detector's statistical logic directly and
+deterministically — time is passed in explicitly rather than read via
+real `Instant::now()` + actual sleeping, since `Instant` has no public
+constructor for an arbitrary point in time but `instant + Duration`
+always works, giving fully deterministic, fast tests instead of flaky
+ones dependent on real wall-clock timing. Verified live against a real
+server too: an established ~1/s baseline, then a real burst, producing
+exactly the expected flagged log lines with a now-plausible baseline
+number — not the implausible ~20-35/s the first bug produced.
+
+**Phase 7 is now complete**: authentication, rate limiting, TLS, and
+scoped anomaly detection, every piece verified live on real hardware,
+including four real bugs found and fixed along the way (the Docker
+healthcheck, the Compose port-merge semantics, and these two anomaly-
+detection bugs) rather than assumed away.
+
+## Status: Phase 8 — Architectural Gaps (in progress)
+
+**Tombstone compaction — done, verified live, including a design
+decision worth understanding, not just a feature to check off.**
+
+Since Phase 3, every delete or update has left the old data behind
+permanently — a tombstone on disk, a stale node in the HNSW graph,
+neither ever reclaimed. Correct, but a long-running server just
+accumulates waste indefinitely. `Engine::compact()` (via
+`POST /v1/compact`, `neurastore compact`, or `client.compact()`) closes
+this:
+
+1. **Merges every on-disk SSTable into one**, dropping superseded
+   (updated-over) record versions.
+2. **Rebuilds the vector index**, if one exists, using whichever params
+   were last used to build it — not silently reverting to defaults,
+   which would have been a real, easy-to-miss regression for anyone
+   using custom HNSW parameters.
+3. **Flushes the memtable first** if anything's pending, so compaction
+   always operates on the fullest possible picture.
+
+**The one non-obvious design choice, worth stating plainly:** tombstones
+are deliberately *kept* in the compacted output, not dropped, even
+though after a full merge the record they shadow is already gone. This
+is a crash-safety choice. If the process dies after the new compacted
+file is written but before the old files are deleted, `Engine::open()`
+loads both and merges them by position — if the tombstone weren't
+there, a deleted record could briefly "reappear" from an older file in
+that exact window. A tombstone is a few bytes; keeping it is a small,
+permanent cost for a real correctness guarantee. A dedicated test
+(`compacted_sstable_retains_tombstone_markers_not_just_absence`) reads
+the compacted file directly to confirm this, rather than only checking
+`get()` returns nothing — which would look identical whether the
+tombstone survived or the record was simply never merged in.
+
+10 new tests (98 Rust tests total: 63 lib + 35 server) plus 3 new
+client-side tests. Verified live end-to-end: inserted records, updated
+one, deleted another, compacted, and confirmed both the file count
+dropped to one *and* the data stayed correct — including a case where
+nothing had been flushed to disk yet at all (compaction correctly
+flushed the memtable first, live, not just in a unit test).
+
+**Multi-collection support — done, verified live, fully backward
+compatible.** One server process can now serve many independent,
+isolated collections — each with its own `Engine` (own WAL, own
+SSTables, own vector index) — instead of exactly one.
+
+Every existing route (`/v1/records`, `/v1/search`, etc.) keeps working
+completely unchanged, operating on a "default" collection rooted at the
+same top-level data directory every deployment has always used — zero
+migration for anyone upgrading. New collections are addressed via
+`/v1/collections/<name>/...` (same full operation set: records, batch
+insert, search, filtered search, index build, compact, stats), created
+lazily on first write, no separate setup step required — matching how
+the default collection has never needed one either. `GET /v1/collections`
+lists everything known, including collections created in a previous
+run that haven't been touched again yet this session.
+
+**Two real design decisions worth knowing about, not just the feature
+itself:**
+1. **The engineering approach was deliberately conservative.** Rather
+   than refactor the existing, heavily-tested handlers to be
+   collection-aware, every operation's core logic was extracted into a
+   small shared `_impl` function, called by two thin wrappers — one for
+   the original routes (unchanged behavior), one for the new
+   collection-scoped routes. The existing routes' *registration* never
+   changed at all. All 35 pre-existing server tests passed unmodified
+   after this refactor, which is the real evidence it didn't quietly
+   change anything.
+2. **Collection names are tightly validated** (letters, digits,
+   underscore, hyphen only) because a name becomes a directory name on
+   disk — an unvalidated name like `../../etc` would be a real path
+   traversal vulnerability, not a theoretical one. A dedicated test
+   fires exactly that kind of name at the API and confirms it's
+   rejected, not merely "hoped to be."
+
+7 new server tests (105 Rust tests total: 63 lib + 42 server) — covering
+real isolation (two collections, same id, genuinely separate records,
+not a coincidental pass), confirming `default` reached through either
+path shares one real engine instance rather than two racing ones,
+listing, and the auth/security middleware applying to the new routes
+exactly like the old ones. Verified live end-to-end too: original
+routes untouched, a brand-new named collection created via a raw curl
+call, real isolation between same-numbered records in different
+collections, and the on-disk layout matching the design exactly
+(`default`'s `wal.log` at the top level, `my_docs/wal.log` in its own
+subdirectory).
+
+**Client and CLI support for named collections — done, verified live.**
+Every `NeuraStoreClient` method accepts an optional `collection`
+argument (default `"default"`); the CLI gets a global `--collection`
+flag and a `collections` subcommand. Every existing call site — every
+method call without the new argument, every pre-existing CLI command
+without the new flag — builds the exact same URLs as before this
+change, verified by running all 23 pre-existing client tests and all 20
+pre-existing CLI tests completely unmodified after adding it. 10 new
+tests (52 client-side tests total). Verified live: default-collection
+backward compatibility, a named collection created via `--collection`,
+correct isolation between same-numbered records in different
+collections, `collections` listing both, and the `NEURASTORE_COLLECTION`
+environment variable working as an alternative to the flag.
+
+**Remaining in this phase, lower priority:** evaluating whether gRPC is
+ever actually worth adding alongside the existing HTTP/JSON API — no
+concrete need for it has come up.
 
 ## Deliberately out of scope for now
 

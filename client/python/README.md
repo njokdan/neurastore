@@ -100,6 +100,48 @@ export NEURASTORE_API_KEY=my-secret-key
 neurastore stats
 ```
 
+## Named collections
+
+Every method accepts a `collection` argument (defaults to `"default"`,
+matching the server's own default). Named collections are created
+lazily on first write:
+
+```python
+client.insert(1, [0.1, 0.2, 0.3], collection="my_docs")
+client.build_index(collection="my_docs")
+results = client.search([0.1, 0.2, 0.3], collection="my_docs")
+
+client.list_collections()  # ["default", "my_docs"]
+```
+
+CLI: pass `--collection` before the subcommand, or set
+`NEURASTORE_COLLECTION`:
+
+```bash
+neurastore --collection my_docs insert --id 1 --vector 0.1,0.2,0.3
+neurastore collections
+```
+
+Omitting `collection` entirely uses the same routes and behavior as
+before multi-collection support existed — nothing changes for existing
+code that doesn't pass it.
+
+## Reclaiming space
+
+Deletes and updates leave old data behind on disk and in the vector
+index until you compact — worth doing periodically on a long-running
+server with a meaningful delete/update rate:
+
+```python
+client.compact()
+```
+
+```bash
+neurastore compact
+```
+
+Safe to call anytime; a no-op if there's nothing to compact.
+
 ## Rate limiting
 
 If the server was started with `NEURASTORE_RATE_LIMIT_RPS` set, the

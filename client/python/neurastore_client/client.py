@@ -81,6 +81,18 @@ class NeuraStoreClient:
     def _url(self, path: str) -> str:
         return f"{self.base_url}{path}"
 
+    def _collection_path(self, collection: str, suffix: str) -> str:
+        """Builds the right path for a given collection. "default" uses
+        the original, pre-multi-collection routes verbatim (e.g.
+        `/v1/records`) -- not `/v1/collections/default/records`, even
+        though the server treats both identically -- specifically so
+        every existing call site, and every test asserting on exact
+        URLs, keeps working completely unchanged. Any other collection
+        name uses the new `/v1/collections/<name>/...` routes."""
+        if collection == "default":
+            return f"/v1{suffix}"
+        return f"/v1/collections/{collection}{suffix}"
+
     def _handle_response(self, response: requests.Response) -> requests.Response:
         if response.status_code == 404:
             raise NotFoundError(_error_message(response))
@@ -120,16 +132,26 @@ class NeuraStoreClient:
 
     # -- Writes ----------------------------------------------------------
 
-    def insert(self, id: int, vector: Sequence[float], metadata: Optional[Dict[str, str]] = None) -> None:
+    def insert(
+        self,
+        id: int,
+        vector: Sequence[float],
+        metadata: Optional[Dict[str, str]] = None,
+        collection: str = "default",
+    ) -> None:
         """Insert or update a single record. Re-using an existing `id` is
-        an update, not an error -- the old vector/metadata is replaced."""
+        an update, not an error -- the old vector/metadata is replaced.
+        `collection` addresses a named collection (created lazily on
+        first write); omit it to use the default collection, exactly as
+        before multi-collection support existed."""
         body = {"id": id, "vector": list(vector), "metadata": metadata or {}}
-        self._request("POST", "/v1/records", json=body)
+        self._request("POST", self._collection_path(collection, "/records"), json=body)
 
     def insert_batch(
         self,
         records: Sequence[Dict],
         binary: bool = False,
+        collection: str = "default",
     ) -> None:
         """Insert or update many records in one request -- one WAL fsync
         for the whole batch server-side, much faster than the equivalent
@@ -150,6 +172,9 @@ class NeuraStoreClient:
         NeuraStore repo's README for that story). Left available since
         it's real, tested infrastructure -- just don't assume it's
         faster without measuring on your own setup.
+
+        `collection` addresses a named collection; omit it for the
+        default collection.
         """
         if not records:
             raise BadRequestError("records must not be empty")
@@ -158,7 +183,7 @@ class NeuraStoreClient:
             body = _encode_binary_batch(records)
             self._request(
                 "POST",
-                "/v1/records/batch/binary",
+                self._collection_path(collection, "/records/batch/binary"),
                 data=body,
                 headers={"Content-Type": "application/octet-stream"},
             )
@@ -167,37 +192,53 @@ class NeuraStoreClient:
                 {"id": r["id"], "vector": list(r["vector"]), "metadata": r.get("metadata", {})}
                 for r in records
             ]}
-            self._request("POST", "/v1/records/batch", json=body)
+            self._request("POST", self._collection_path(collection, "/records/batch"), json=body)
 
-    def delete(self, id: int) -> None:
+    def delete(self, id: int, collection: str = "default") -> None:
         """Soft-delete a record. A no-op (does not raise) if the id
         doesn't exist -- matches the server's own delete semantics."""
-        self._request("DELETE", f"/v1/records/{id}")
+        self._request("DELETE", self._collection_path(collection, f"/records/{id}"))
 
-    def build_index(self) -> None:
+    def build_index(self, collection: str = "default") -> None:
         """Build (or rebuild) the vector index from all currently live
         records. Required before `search()`/`search_filtered()` will
         work -- calling it again later is optional, not required for
         correctness (writes made after the first `build_index()` call
         are kept in sync automatically), but can help reclaim space from
         accumulated soft-deletes."""
-        self._request("POST", "/v1/index/build")
+        self._request("POST", self._collection_path(collection, "/index/build"))
+
+    def compact(self, collection: str = "default") -> None:
+        """Reclaims space accumulated from deletes and updates -- merges
+        on-disk storage into a single file (dropping superseded record
+        versions) and, if an index has been built, rebuilds it too
+        (dropping stale/tombstoned graph nodes). Safe to call anytime;
+        a no-op if there's nothing to compact. Worth calling periodically
+        on a long-running server with a meaningful delete/update rate --
+        without it, deleted and superseded data accumulates indefinitely."""
+        self._request("POST", self._collection_path(collection, "/compact"))
 
     # -- Reads -----------------------------------------------------------
 
-    def get(self, id: int) -> Record:
+    def get(self, id: int, collection: str = "default") -> Record:
         """Fetch a single record by id. Raises NotFoundError if it
         doesn't exist or was deleted."""
-        response = self._request("GET", f"/v1/records/{id}")
+        response = self._request("GET", self._collection_path(collection, f"/records/{id}"))
         return Record._from_json(response.json())
 
-    def search(self, vector: Sequence[float], k: int = 10, ef_search: int = 40) -> List[SearchResult]:
+    def search(
+        self,
+        vector: Sequence[float],
+        k: int = 10,
+        ef_search: int = 40,
+        collection: str = "default",
+    ) -> List[SearchResult]:
         """Approximate k-nearest-neighbor search. `ef_search` trades
         recall for latency -- higher explores more of the graph for
         better accuracy at the cost of speed. Raises BadRequestError if
         `build_index()` hasn't been called yet."""
         body = {"vector": list(vector), "k": k, "ef_search": ef_search}
-        response = self._request("POST", "/v1/search", json=body)
+        response = self._request("POST", self._collection_path(collection, "/search"), json=body)
         return [SearchResult._from_json(r) for r in response.json()["results"]]
 
     def search_filtered(
@@ -207,6 +248,7 @@ class NeuraStoreClient:
         value: str,
         k: int = 10,
         ef_search: int = 40,
+        collection: str = "default",
     ) -> List[SearchResult]:
         """k-NN search restricted to records where `metadata[field] ==
         value`. The predicate is pushed into the search itself (or
@@ -215,14 +257,21 @@ class NeuraStoreClient:
         after fetching it -- see the main NeuraStore repo's README for
         why that distinction is the whole point of this method existing."""
         body = {"vector": list(vector), "k": k, "ef_search": ef_search, "field": field, "value": value}
-        response = self._request("POST", "/v1/search/filtered", json=body)
+        response = self._request("POST", self._collection_path(collection, "/search/filtered"), json=body)
         return [SearchResult._from_json(r) for r in response.json()["results"]]
 
-    def stats(self) -> Stats:
+    def stats(self, collection: str = "default") -> Stats:
         """Current collection statistics -- live record count, whether
         the index has been built, etc."""
-        response = self._request("GET", "/v1/stats")
+        response = self._request("GET", self._collection_path(collection, "/stats"))
         return Stats._from_json(response.json())
+
+    def list_collections(self) -> List[str]:
+        """Lists every known collection, including ones created in a
+        previous server run that haven't been touched again yet this
+        session. Always includes "default"."""
+        response = self._request("GET", "/v1/collections")
+        return response.json()["collections"]
 
 
 def _error_message(response: requests.Response) -> str:

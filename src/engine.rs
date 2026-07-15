@@ -64,6 +64,12 @@ pub struct Engine {
     /// requiring a rebuild. `Arc<RwLock<_>>` so `index_handle()` can hand
     /// out a reference safe to use concurrently from other threads.
     vector_index: Option<Arc<RwLock<VectorIndex>>>,
+    /// Params/seed used for the most recent `build_index_with_params()`
+    /// call, so `compact()` can rebuild the index (if one exists) with
+    /// the same configuration instead of silently reverting to defaults
+    /// -- a real gap that would otherwise bite anyone who'd built their
+    /// index with custom params before ever calling `compact()`.
+    index_params: Option<(HnswParams, u64)>,
 }
 
 impl Engine {
@@ -122,6 +128,7 @@ impl Engine {
             seq: AtomicU64::new(max_seq),
             flush_threshold: DEFAULT_FLUSH_THRESHOLD,
             vector_index: None,
+            index_params: None,
         })
     }
 
@@ -267,6 +274,7 @@ impl Engine {
     pub fn build_index_with_params(&mut self, params: HnswParams, seed: u64) {
         let records = self.scan_live();
         self.vector_index = Some(Arc::new(RwLock::new(VectorIndex::build(&records, params, seed))));
+        self.index_params = Some((params, seed));
     }
 
     pub fn has_index(&self) -> bool {
@@ -347,6 +355,75 @@ impl Engine {
 
         self.memtable.clear();
         self.wal.clear()?;
+        Ok(())
+    }
+
+    /// Reclaims space accumulated from deletes and updates. Since Phase
+    /// 3, every delete or update has left the old data behind forever
+    /// (a soft-delete tombstone on disk, a stale node in the HNSW
+    /// graph) -- correct, but a long-running server just accumulates
+    /// waste indefinitely with nothing to reclaim it. This does both
+    /// halves of that in one call:
+    ///
+    /// 1. **SSTable compaction**: merges every on-disk SSTable into one,
+    ///    dropping superseded (updated-over) record versions. Tombstones
+    ///    are deliberately KEPT, not dropped, even though the record
+    ///    they shadow is gone after a full merge -- this is a crash-
+    ///    safety choice, not an oversight. If the process crashes after
+    ///    the new compacted file is written but before the old files are
+    ///    deleted, `Engine::open()` will load both old and new files and
+    ///    merge them by position (newest wins) -- if the tombstone
+    ///    weren't there, a deleted record could incorrectly "reappear"
+    ///    from an older file in that exact crash window. A tombstone is
+    ///    a few bytes; keeping it is a small, permanent cost for a large
+    ///    correctness guarantee.
+    /// 2. **Index rebuild**: if a vector index already exists, rebuilds
+    ///    it from the now-compacted live data, using whichever params
+    ///    were last used to build it (not silently reverting to
+    ///    defaults) -- this drops stale/tombstoned HNSW graph nodes that
+    ///    have been dead weight (still traversed, just filtered from
+    ///    results) since whenever they were deleted or superseded.
+    ///
+    /// Safe to call with 0 or 1 SSTables (a no-op) or no index built yet
+    /// (skips that half). Flushes the memtable first if it's non-empty,
+    /// so compaction operates on the fullest possible picture.
+    pub fn compact(&mut self) -> Result<(), EngineError> {
+        self.flush()?;
+
+        if self.sstables.len() > 1 {
+            // Merge oldest-to-newest, same ordering rule `scan_live`
+            // uses -- a later SSTable's entry for a given id always
+            // wins. Unlike `scan_live`, tombstones are kept in the
+            // output (see the doc comment above for why).
+            let mut merged: BTreeMap<RecordId, Record> = BTreeMap::new();
+            for sst in &self.sstables {
+                for record in sst.iter() {
+                    merged.insert(record.id, record);
+                }
+            }
+            let compacted_records: Vec<Record> = merged.into_values().collect();
+
+            let old_paths: Vec<PathBuf> = self.sstables.iter().map(|s| s.path().to_path_buf()).collect();
+
+            let filename = format!("{:06}.sst", self.next_sstable_id);
+            let new_path = self.dir.join(&filename);
+            sstable::write_sstable(&new_path, &compacted_records)?;
+            self.next_sstable_id += 1;
+
+            // Only after the new file is durably written: swap it in,
+            // then clean up the old files. If the process dies before
+            // this cleanup finishes, the stale files just linger --
+            // safe or retry, not a correctness problem (see doc comment).
+            self.sstables = vec![SSTableReader::open(&new_path)?];
+            for old_path in old_paths {
+                let _ = fs::remove_file(old_path); // best-effort; a leftover file is safe, not silently wrong
+            }
+        }
+
+        if let Some((params, seed)) = self.index_params {
+            self.build_index_with_params(params, seed);
+        }
+
         Ok(())
     }
 }
@@ -741,6 +818,159 @@ mod tests {
 
         let code_results = engine.search_knn_filtered(&[0.0, 0.0], 5, 50, "category", "code").unwrap();
         assert!(code_results.iter().any(|(id, _)| *id == 1), "id 1 should match 'code' after the update");
+    }
+
+    #[test]
+    fn compact_is_safe_noop_with_zero_or_one_sstables() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::open(dir.path()).unwrap();
+        engine.compact().unwrap(); // zero sstables, zero records -- must not error
+
+        engine.put(1, vec![1.0], HashMap::new()).unwrap();
+        engine.flush().unwrap();
+        assert_eq!(engine.sstable_count(), 1);
+        engine.compact().unwrap(); // one sstable -- nothing to merge, must not error
+        assert_eq!(engine.get(1).unwrap().vector, vec![1.0]);
+    }
+
+    #[test]
+    fn compact_merges_multiple_sstables_into_one_and_keeps_all_live_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::open(dir.path()).unwrap();
+
+        for i in 1..=5u64 {
+            engine.put(i, vec![i as f32], HashMap::new()).unwrap();
+            engine.flush().unwrap(); // one sstable per record -- 5 total
+        }
+        assert_eq!(engine.sstable_count(), 5);
+
+        engine.compact().unwrap();
+        assert_eq!(engine.sstable_count(), 1, "compaction should merge everything into a single sstable");
+        for i in 1..=5u64 {
+            assert_eq!(engine.get(i).unwrap().vector, vec![i as f32]);
+        }
+        assert_eq!(engine.len(), 5);
+    }
+
+    #[test]
+    fn compact_drops_superseded_versions_but_keeps_final_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::open(dir.path()).unwrap();
+
+        engine.put(1, vec![1.0], HashMap::new()).unwrap();
+        engine.flush().unwrap();
+        engine.put(1, vec![99.0], HashMap::new()).unwrap(); // update
+        engine.flush().unwrap();
+        assert_eq!(engine.sstable_count(), 2);
+
+        engine.compact().unwrap();
+        assert_eq!(engine.sstable_count(), 1);
+        assert_eq!(engine.get(1).unwrap().vector, vec![99.0], "only the final, most recent version should survive compaction");
+        assert_eq!(engine.len(), 1, "not two logical records -- the stale version must be gone, not just shadowed");
+    }
+
+    #[test]
+    fn compact_flushes_pending_memtable_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::open(dir.path()).unwrap();
+        engine.put(1, vec![1.0], HashMap::new()).unwrap();
+        engine.flush().unwrap();
+
+        // This record is deliberately left in the memtable, unflushed,
+        // when compact() is called -- it must still end up correctly
+        // captured in the compacted output, not silently dropped.
+        engine.put(2, vec![2.0], HashMap::new()).unwrap();
+        assert_eq!(engine.memtable_len(), 1);
+
+        engine.compact().unwrap();
+        assert_eq!(engine.memtable_len(), 0, "compact() should flush the memtable as part of its work");
+        assert_eq!(engine.get(2).unwrap().vector, vec![2.0]);
+        assert_eq!(engine.len(), 2);
+    }
+
+    #[test]
+    fn compacted_sstable_retains_tombstone_markers_not_just_absence() {
+        // The specific, deliberate crash-safety design choice documented
+        // on compact(): a delete's tombstone is kept in the compacted
+        // output, not dropped, even though after a full merge the record
+        // it shadows is already gone. This test inspects the compacted
+        // file's raw contents directly (not just engine.get(), which
+        // would look identical whether the tombstone survived or the
+        // record was simply never merged in) to confirm the tombstone
+        // itself is really there.
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::open(dir.path()).unwrap();
+        engine.put(1, vec![1.0], HashMap::new()).unwrap();
+        engine.flush().unwrap();
+        engine.delete(1).unwrap();
+        engine.flush().unwrap();
+        assert_eq!(engine.sstable_count(), 2);
+
+        engine.compact().unwrap();
+        assert_eq!(engine.sstable_count(), 1);
+
+        // Read the compacted file directly, bypassing the engine's own
+        // get()/scan_live() merge logic, to see the raw stored record.
+        let compacted_path = engine.dir.join("000003.sst"); // 2 flushes + 1 compacted file = next id is 3
+        let reader = sstable::SSTableReader::open(&compacted_path).unwrap();
+        let raw = reader.get(1).expect("the tombstone record itself should still be present in the file");
+        assert!(raw.deleted, "the record read from the compacted file must be a tombstone, not simply absent");
+    }
+
+    #[test]
+    fn compact_rebuilds_index_when_one_exists_using_previously_used_params() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::open(dir.path()).unwrap();
+        for i in 1..=5u64 {
+            engine.put(i, vec![i as f32, 0.0], HashMap::new()).unwrap();
+        }
+        // Build with deliberately non-default params, to confirm compact()
+        // doesn't silently revert to HnswParams::default() on rebuild.
+        let custom_params = HnswParams { m: 8, m_max0: 16, ef_construction: 32 };
+        engine.build_index_with_params(custom_params, 7);
+        assert_eq!(engine.index_len(), Some(5));
+
+        engine.delete(3).unwrap();
+        engine.flush().unwrap();
+        engine.compact().unwrap();
+
+        assert!(engine.has_index(), "compact() should not tear down an existing index");
+        assert_eq!(engine.index_len(), Some(4), "rebuilt index should reflect the post-compaction live count (5 - 1 deleted)");
+        assert!(engine.search_knn(&[3.0, 0.0], 5, 20).unwrap().iter().all(|(id, _)| *id != 3), "deleted record must not reappear in the rebuilt index");
+    }
+
+    #[test]
+    fn compact_does_not_touch_index_when_none_was_built() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::open(dir.path()).unwrap();
+        engine.put(1, vec![1.0], HashMap::new()).unwrap();
+        engine.flush().unwrap();
+        engine.compact().unwrap();
+        assert!(!engine.has_index(), "compact() must not build an index that was never requested");
+    }
+
+    #[test]
+    fn data_survives_restart_after_compact() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut engine = Engine::open(dir.path()).unwrap();
+            for i in 1..=5u64 {
+                engine.put(i, vec![i as f32], HashMap::new()).unwrap();
+                engine.flush().unwrap();
+            }
+            engine.delete(2).unwrap();
+            engine.flush().unwrap();
+            engine.compact().unwrap();
+        }
+        // Fresh Engine, no in-memory state carried over -- proves the
+        // compacted file on disk is itself correctly durable and readable.
+        let engine = Engine::open(dir.path()).unwrap();
+        assert_eq!(engine.sstable_count(), 1);
+        assert!(engine.get(2).is_none(), "delete must survive both compaction and a restart");
+        for i in [1u64, 3, 4, 5] {
+            assert_eq!(engine.get(i).unwrap().vector, vec![i as f32]);
+        }
+        assert_eq!(engine.len(), 4);
     }
 
     #[test]

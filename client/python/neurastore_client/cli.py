@@ -76,10 +76,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="API key, if the server has authentication enabled (default: $NEURASTORE_API_KEY)",
     )
     parser.add_argument("--json", action="store_true", help="output machine-readable JSON instead of text")
+    parser.add_argument(
+        "--collection",
+        default=os.environ.get("NEURASTORE_COLLECTION", "default"),
+        help="named collection to operate on (default: 'default', or $NEURASTORE_COLLECTION). Created on first write if it doesn't exist yet.",
+    )
 
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("health", help="check whether the server is reachable")
+    sub.add_parser("collections", help="list all known collections")
 
     p = sub.add_parser("insert", help="insert or update a single record")
     p.add_argument("--id", type=int, required=True)
@@ -101,6 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--id", type=int, required=True)
 
     sub.add_parser("build-index", help="build (or rebuild) the vector index")
+    sub.add_parser("compact", help="reclaim space from deleted/superseded records (merges storage, rebuilds index if one exists)")
 
     p = sub.add_parser("search", help="unfiltered k-NN search")
     p.add_argument("--vector", type=_parse_vector, required=True)
@@ -135,19 +142,24 @@ def run(args: argparse.Namespace) -> int:
             print(json.dumps({"healthy": ok}) if args.json else ("ok" if ok else "unreachable"))
             return 0 if ok else 1
 
+        if args.command == "collections":
+            names = client.list_collections()
+            print(json.dumps(names) if args.json else "\n".join(names))
+            return 0
+
         if args.command == "insert":
-            client.insert(args.id, args.vector, metadata=_parse_metadata(args.metadata))
+            client.insert(args.id, args.vector, metadata=_parse_metadata(args.metadata), collection=args.collection)
             print(f"inserted id={args.id}")
             return 0
 
         if args.command == "insert-batch":
             records = _load_batch_file(args.file)
-            client.insert_batch(records, binary=args.binary)
+            client.insert_batch(records, binary=args.binary, collection=args.collection)
             print(f"inserted {len(records)} records")
             return 0
 
         if args.command == "get":
-            record = client.get(args.id)
+            record = client.get(args.id, collection=args.collection)
             if args.json:
                 print(json.dumps({"id": record.id, "vector": record.vector, "metadata": record.metadata}, indent=2))
             else:
@@ -157,29 +169,34 @@ def run(args: argparse.Namespace) -> int:
             return 0
 
         if args.command == "delete":
-            client.delete(args.id)
+            client.delete(args.id, collection=args.collection)
             print(f"deleted id={args.id}")
             return 0
 
         if args.command == "build-index":
-            client.build_index()
+            client.build_index(collection=args.collection)
             print("index built")
             return 0
 
+        if args.command == "compact":
+            client.compact(collection=args.collection)
+            print("compacted")
+            return 0
+
         if args.command == "search":
-            results = client.search(args.vector, k=args.k, ef_search=args.ef_search)
+            results = client.search(args.vector, k=args.k, ef_search=args.ef_search, collection=args.collection)
             _print_results(results, args.json)
             return 0
 
         if args.command == "search-filtered":
             results = client.search_filtered(
-                args.vector, field=args.field, value=args.value, k=args.k, ef_search=args.ef_search
+                args.vector, field=args.field, value=args.value, k=args.k, ef_search=args.ef_search, collection=args.collection
             )
             _print_results(results, args.json)
             return 0
 
         if args.command == "stats":
-            stats = client.stats()
+            stats = client.stats(collection=args.collection)
             if args.json:
                 print(json.dumps(stats.__dict__, indent=2))
             else:

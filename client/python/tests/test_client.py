@@ -99,6 +99,13 @@ def test_build_index_posts_to_correct_endpoint(client):
 
 
 @responses.activate
+def test_compact_posts_to_correct_endpoint(client):
+    responses.add(responses.POST, f"{BASE_URL}/v1/compact", status=200)
+    client.compact()
+    assert responses.calls[0].request.url == f"{BASE_URL}/v1/compact"
+
+
+@responses.activate
 def test_search_returns_parsed_results(client):
     responses.add(
         responses.POST,
@@ -272,3 +279,54 @@ def test_insert_batch_binary_rejects_mismatched_dimension(client):
             ],
             binary=True,
         )
+
+
+@responses.activate
+def test_insert_with_named_collection_uses_collection_scoped_url(client):
+    responses.add(responses.POST, f"{BASE_URL}/v1/collections/my_docs/records", status=201)
+    client.insert(1, [1.0], collection="my_docs")
+    assert responses.calls[0].request.url == f"{BASE_URL}/v1/collections/my_docs/records"
+
+
+@responses.activate
+def test_get_with_named_collection_uses_collection_scoped_url(client):
+    responses.add(
+        responses.GET,
+        f"{BASE_URL}/v1/collections/my_docs/records/1",
+        json={"id": 1, "vector": [1.0], "metadata": {}},
+        status=200,
+    )
+    client.get(1, collection="my_docs")
+    assert responses.calls[0].request.url == f"{BASE_URL}/v1/collections/my_docs/records/1"
+
+
+@responses.activate
+def test_default_collection_uses_original_unprefixed_urls(client):
+    # Not /v1/collections/default/records -- the original /v1/records,
+    # verbatim, so every pre-multi-collection call site (and every test
+    # in this file) keeps working with zero changes.
+    responses.add(responses.POST, f"{BASE_URL}/v1/records", status=201)
+    client.insert(1, [1.0])  # collection not passed -- defaults to "default"
+    assert responses.calls[0].request.url == f"{BASE_URL}/v1/records"
+
+
+@responses.activate
+def test_search_and_delete_and_compact_respect_named_collection(client):
+    responses.add(responses.POST, f"{BASE_URL}/v1/collections/my_docs/search", json={"results": []}, status=200)
+    client.search([1.0], collection="my_docs")
+    assert responses.calls[0].request.url == f"{BASE_URL}/v1/collections/my_docs/search"
+
+    responses.add(responses.DELETE, f"{BASE_URL}/v1/collections/my_docs/records/1", status=204)
+    client.delete(1, collection="my_docs")
+    assert responses.calls[1].request.url == f"{BASE_URL}/v1/collections/my_docs/records/1"
+
+    responses.add(responses.POST, f"{BASE_URL}/v1/collections/my_docs/compact", status=200)
+    client.compact(collection="my_docs")
+    assert responses.calls[2].request.url == f"{BASE_URL}/v1/collections/my_docs/compact"
+
+
+@responses.activate
+def test_list_collections_returns_names(client):
+    responses.add(responses.GET, f"{BASE_URL}/v1/collections", json={"collections": ["default", "my_docs"]}, status=200)
+    names = client.list_collections()
+    assert names == ["default", "my_docs"]

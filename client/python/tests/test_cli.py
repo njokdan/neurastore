@@ -125,6 +125,14 @@ def test_build_index(capsys):
 
 
 @responses.activate
+def test_compact(capsys):
+    responses.add(responses.POST, f"{BASE_URL}/v1/compact", status=200)
+    code, out, _ = run_cli(["compact"], capsys)
+    assert code == 0
+    assert "compacted" in out
+
+
+@responses.activate
 def test_search_prints_table(capsys):
     responses.add(
         responses.POST,
@@ -194,6 +202,42 @@ def test_api_key_flag_sends_authorization_header(capsys):
     code = run(args)
     assert code == 0
     assert responses.calls[0].request.headers["Authorization"] == "Bearer my-secret-key"
+
+
+@responses.activate
+def test_collection_flag_uses_collection_scoped_url(capsys):
+    responses.add(responses.POST, f"{BASE_URL}/v1/collections/my_docs/records", status=201)
+    code, out, _ = run_cli(["--collection", "my_docs", "insert", "--id", "1", "--vector", "1.0"], capsys)
+    assert code == 0
+    assert responses.calls[0].request.url == f"{BASE_URL}/v1/collections/my_docs/records"
+
+
+@responses.activate
+def test_no_collection_flag_uses_default_unprefixed_url(capsys):
+    responses.add(responses.POST, f"{BASE_URL}/v1/records", status=201)
+    code, out, _ = run_cli(["insert", "--id", "1", "--vector", "1.0"], capsys)
+    assert code == 0
+    assert responses.calls[0].request.url == f"{BASE_URL}/v1/records"
+
+
+@responses.activate
+def test_collections_subcommand_lists_names(capsys):
+    responses.add(responses.GET, f"{BASE_URL}/v1/collections", json={"collections": ["default", "my_docs"]}, status=200)
+    code, out, _ = run_cli(["collections"], capsys)
+    assert code == 0
+    assert "default" in out
+    assert "my_docs" in out
+
+
+@responses.activate
+def test_collections_subcommand_json_output(capsys):
+    responses.add(responses.GET, f"{BASE_URL}/v1/collections", json={"collections": ["default"]}, status=200)
+    parser = build_parser()
+    args = parser.parse_args(["--url", BASE_URL, "--json", "collections"])
+    code = run(args)
+    out = capsys.readouterr().out
+    assert code == 0
+    assert json.loads(out) == ["default"]
 
 
 @responses.activate

@@ -85,3 +85,15 @@ def test_stats_reflects_inserted_data(client):
     client.insert(9301, [1.0])
     stats = client.stats()
     assert stats.live_records >= 1
+
+
+def test_compact_reclaims_space_and_keeps_data_correct(client):
+    client.insert(9401, [1.0, 1.0], metadata={"category": "docs"})
+    client.insert(9401, [2.0, 2.0], metadata={"category": "docs"})  # update, same id
+    client.delete(9401)
+    client.insert(9402, [3.0, 3.0])
+    client.compact()  # should not raise, data must still be correct after
+
+    with pytest.raises(NotFoundError):
+        client.get(9401)
+    assert client.get(9402).vector == [3.0, 3.0]
