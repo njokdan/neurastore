@@ -1,62 +1,19 @@
 # NeuraStore
 
-A unified vector + structured-filter database engine, written in Rust
-— hybrid similarity + filter search without the overfetch tax most
-systems pay for that combination.
+A unified storage/query engine for AI-native workloads — hybrid vector +
+structured-filter queries on data that's still being written, in one
+engine, without a separate ETL/reindex pipeline.
 
-## Try it in a couple of minutes
+## Headline claim (what we're proving)
 
-```bash
-docker compose up --build
-curl http://localhost:8080/health
-```
-(First build compiles from scratch and takes a few minutes — one-time
-cost. Subsequent starts are fast.)
+Sub-millisecond hybrid vector + structured-filter queries on live-writing
+data, benchmarked head-to-head against pgvector and Milvus.
 
-```bash
-pip install -e client/python
-```
-```python
-from neurastore_client import NeuraStoreClient
-client = NeuraStoreClient("http://localhost:8080")
-client.insert(1, [0.1, 0.2, 0.3], metadata={"category": "docs"})
-client.build_index()
-results = client.search([0.1, 0.2, 0.3], k=5)
-```
-
-## Why this exists
-
-Most vector databases pay a real latency penalty the moment a
-similarity search gets a structured filter attached — either they
-overfetch an unfiltered result set and discard most of it, or they
-maintain the filter and the vector index as two systems that can drift
-out of sync. Measured directly: pgvector pays about a 2.6x tax on
-filtered queries versus unfiltered ones.
-
-NeuraStore pushes the filter directly into the HNSW graph traversal
-instead. Three real, fairly-measured wins — full methodology, every
-number reproducible, in [`COMPARISON.md`](./COMPARISON.md):
-
-| Metric | pgvector | Milvus | NeuraStore |
-|---|---|---|---|
-| Recall@10 | 0.984 | 0.988 | 0.983 |
-| Insert (vec/sec) | 1,633 | 2,545 | 15,649–17,927 |
-| Filtered-query latency tax | 2.6x | ~1.1x | 1.13–1.32x |
-
-**This isn't trying to replace Pinecone or Milvus.** It's a narrow,
-proven bet on one specific problem. The honest gaps — one vector type
-(dense float32 only), one index type (HNSW only), single-node only, no
-hybrid/full-text search — are in [`PORTFOLIO.md`](./PORTFOLIO.md) and
-`COMPARISON.md`, stated plainly, not hidden.
-
-## What the rest of this document is
-
-Everything below this point is the full, phase-by-phase build log —
-every architecture decision, every benchmark, and every bug found and
-fixed along the way, left visible rather than cleaned up afterward.
-**If you want the short version first, read [`PORTFOLIO.md`](./PORTFOLIO.md)
-instead** — it's built specifically to be that entry point. What
-follows here is the detailed reference underneath it.
+**See [`COMPARISON.md`](./COMPARISON.md) for the full, fairly-measured
+head-to-head — every number client-to-server, every claim reproducible.
+See [`PORTFOLIO.md`](./PORTFOLIO.md) for the high-level summary: what
+this is, the numbers that matter, and the engineering story behind
+them.**
 
 ## Status: Phase 1 — Storage Engine Core (complete)
 
@@ -217,7 +174,7 @@ The multi-threaded concurrency test
 (`concurrent_reads_and_writes_are_actually_thread_safe`) was also run 5x
 back-to-back on real hardware with no flakiness.
 
-## Status: Phase 4 — Query Fusion (complete, confirmed with real benchmark numbers)
+## Status: Phase 4 — Query Fusion (complete, correctness proven, benchmark pending real numbers)
 
 This is the phase the whole project's headline target has pointed at
 since Phase 0: pgvector pays a ~2.6x latency tax the moment a filter is
@@ -567,7 +524,7 @@ performance problem, because it didn't need to.
 | 5 | Interface & hardening — gRPC/HTTP API, load testing, benchmark report | ✅ HTTP/JSON API complete — 67 tests total (55 lib + 12 server). **Full fair client-server comparison done, every metric a real win or tie**: insert 15,649-17,927 vec/sec (9-11x pgvector, after finding and fixing a test methodology bug), unfiltered/filtered latency and filter tax all beat or tie both baselines. Load testing / hardening (auth, rate limiting) still ahead. See README section above. |
 | 6 | Usability — Docker, Python client, CLI | ✅ complete — all three verified on real hardware/live servers, not just written. 52 client-side tests (35 unit + 17 integration). See README section above. |
 | 7 | Hardening — auth, rate limiting, TLS, scoped anomaly detection | ✅ complete — all four pieces verified live on real hardware. 88 Rust tests, 41 client-side tests. Four real bugs found and fixed during verification (a Docker healthcheck, a Compose merge-semantics gotcha, and two anomaly-detection statistical bugs), not assumed away. See README section above. |
-| 8 | Architectural gaps — multi-collection, tombstone compaction, maybe gRPC | ✅ complete (except gRPC, deliberately deferred — no concrete need for it has come up) — tombstone compaction, multi-collection support (server + Python client + CLI), all verified live. 105 Rust tests, 52 Python client-side tests. Fully backward compatible — zero migration for existing deployments. See README section above. |
+| 8 | Architectural gaps — multi-collection, tombstone compaction, maybe gRPC | 🔶 in progress — tombstone compaction AND multi-collection support both complete (105 Rust tests, verified live). Fully backward compatible -- zero migration for existing deployments. gRPC not yet justified by any concrete need. See README section above. |
 
 ## Reducing benchmark noise on Windows
 
@@ -669,7 +626,7 @@ example in this phase — the Python quickstart, every CLI command, the
 Docker persistence cycle — was actually run against a real server, not
 just written and assumed to work.
 
-## Status: Phase 7 — Hardening (complete)
+## Status: Phase 7 — Hardening (in progress)
 
 Right now the server has zero protection — anyone who can reach it over
 the network has full read/write/delete access to everything. This phase
@@ -850,7 +807,7 @@ including four real bugs found and fixed along the way (the Docker
 healthcheck, the Compose port-merge semantics, and these two anomaly-
 detection bugs) rather than assumed away.
 
-## Status: Phase 8 — Architectural Gaps (complete, except gRPC which remains deliberately deferred)
+## Status: Phase 8 — Architectural Gaps (in progress)
 
 **Tombstone compaction — done, verified live, including a design
 decision worth understanding, not just a feature to check off.**
