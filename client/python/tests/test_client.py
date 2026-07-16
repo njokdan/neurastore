@@ -99,6 +99,34 @@ def test_build_index_posts_to_correct_endpoint(client):
 
 
 @responses.activate
+def test_build_index_with_no_metric_sends_no_body(client):
+    responses.add(responses.POST, f"{BASE_URL}/v1/index/build", status=200)
+    client.build_index()
+    assert responses.calls[0].request.body is None, "omitting metric should send no body at all, matching pre-metric-support behavior"
+
+
+@responses.activate
+def test_build_index_with_metric_sends_it_in_body(client):
+    import json
+    responses.add(responses.POST, f"{BASE_URL}/v1/index/build", status=200)
+    client.build_index(metric="cosine")
+    body = json.loads(responses.calls[0].request.body)
+    assert body == {"metric": "cosine"}
+
+
+@responses.activate
+def test_build_index_rejects_unknown_metric_via_server_error(client):
+    responses.add(
+        responses.POST,
+        f"{BASE_URL}/v1/index/build",
+        json={"error": "unknown metric 'manhattan' -- expected 'l2', 'cosine', or 'dot_product'"},
+        status=400,
+    )
+    with pytest.raises(BadRequestError, match="unknown metric"):
+        client.build_index(metric="manhattan")
+
+
+@responses.activate
 def test_compact_posts_to_correct_endpoint(client):
     responses.add(responses.POST, f"{BASE_URL}/v1/compact", status=200)
     client.compact()
@@ -141,6 +169,34 @@ def test_search_filtered_sends_field_and_value(client):
     body = json.loads(responses.calls[0].request.body)
     assert body["field"] == "category"
     assert body["value"] == "docs"
+
+
+@responses.activate
+def test_search_filtered_defaults_op_to_eq(client):
+    import json
+    responses.add(responses.POST, f"{BASE_URL}/v1/search/filtered", json={"results": []}, status=200)
+    client.search_filtered([0.0, 0.0], field="category", value="docs")
+    body = json.loads(responses.calls[0].request.body)
+    assert body["op"] == "eq"
+
+
+@responses.activate
+def test_search_filtered_with_range_op_sends_numeric_value(client):
+    import json
+    responses.add(responses.POST, f"{BASE_URL}/v1/search/filtered", json={"results": []}, status=200)
+    client.search_filtered([0.0, 0.0], field="price", value=100, op="gte")
+    body = json.loads(responses.calls[0].request.body)
+    assert body["op"] == "gte"
+    assert body["value"] == 100
+
+
+@responses.activate
+def test_insert_with_typed_metadata_sends_natural_json_types(client):
+    import json
+    responses.add(responses.POST, f"{BASE_URL}/v1/records", status=201)
+    client.insert(1, [1.0], metadata={"category": "docs", "price": 29.99, "in_stock": True})
+    body = json.loads(responses.calls[0].request.body)
+    assert body["metadata"] == {"category": "docs", "price": 29.99, "in_stock": True}
 
 
 @responses.activate

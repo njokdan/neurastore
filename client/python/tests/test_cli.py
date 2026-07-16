@@ -55,10 +55,30 @@ def test_insert_parses_vector_and_metadata(capsys):
 def test_insert_supports_multiple_metadata_pairs(capsys):
     responses.add(responses.POST, f"{BASE_URL}/v1/records", status=201)
     run_cli(
-        ["insert", "--id", "1", "--vector", "1.0", "--metadata", "a=1", "--metadata", "b=2"], capsys
+        ["insert", "--id", "1", "--vector", "1.0", "--metadata", "a=foo", "--metadata", "b=bar"], capsys
     )
     sent_body = json.loads(responses.calls[0].request.body)
-    assert sent_body["metadata"] == {"a": "1", "b": "2"}
+    assert sent_body["metadata"] == {"a": "foo", "b": "bar"}
+
+
+@responses.activate
+def test_insert_metadata_infers_numeric_and_boolean_types(capsys):
+    responses.add(responses.POST, f"{BASE_URL}/v1/records", status=201)
+    run_cli(
+        ["insert", "--id", "1", "--vector", "1.0", "--metadata", "price=29.99", "--metadata", "count=5", "--metadata", "in_stock=true"],
+        capsys,
+    )
+    sent_body = json.loads(responses.calls[0].request.body)
+    assert sent_body["metadata"] == {"price": 29.99, "count": 5, "in_stock": True}
+
+
+@responses.activate
+def test_search_filtered_with_op_and_numeric_value(capsys):
+    responses.add(responses.POST, f"{BASE_URL}/v1/search/filtered", json={"results": []}, status=200)
+    run_cli(["search-filtered", "--vector", "0.0,0.0", "--field", "price", "--op", "gte", "--value", "100"], capsys)
+    body = json.loads(responses.calls[0].request.body)
+    assert body["op"] == "gte"
+    assert body["value"] == 100
 
 
 def test_insert_rejects_malformed_vector(capsys):
@@ -122,6 +142,31 @@ def test_build_index(capsys):
     code, out, _ = run_cli(["build-index"], capsys)
     assert code == 0
     assert "index built" in out
+
+
+@responses.activate
+def test_build_index_with_metric_flag_sends_it(capsys):
+    responses.add(responses.POST, f"{BASE_URL}/v1/index/build", status=200)
+    code, out, _ = run_cli(["build-index", "--metric", "cosine"], capsys)
+    assert code == 0
+    assert "cosine" in out
+    body = json.loads(responses.calls[0].request.body)
+    assert body == {"metric": "cosine"}
+
+
+@responses.activate
+def test_build_index_without_metric_flag_sends_no_body(capsys):
+    responses.add(responses.POST, f"{BASE_URL}/v1/index/build", status=200)
+    code, out, _ = run_cli(["build-index"], capsys)
+    assert code == 0
+    assert responses.calls[0].request.body is None
+    assert "l2" in out
+
+
+def test_build_index_rejects_invalid_metric_choice():
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--url", BASE_URL, "build-index", "--metric", "manhattan"])
 
 
 @responses.activate

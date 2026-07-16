@@ -12,9 +12,17 @@
 //! benchmarkable single-threaded index -- the foundation Phase 3 adds
 //! concurrency safety on top of.
 //!
-//! Distance metric: squared Euclidean (L2). Matches the `vector_l2_ops` /
-//! `metric_type: L2` used in the pgvector/Milvus baseline benchmarks, so
-//! NeuraStore's numbers are directly comparable to those.
+//! Distance metric: configurable per index via `DistanceMetric`,
+//! defaulting to squared Euclidean (L2) for full backward compatibility
+//! with every existing benchmark and stored index. L2 matches the
+//! `vector_l2_ops` / `metric_type: L2` used in the pgvector/Milvus
+//! baseline benchmarks, so NeuraStore's existing numbers stay directly
+//! comparable. Cosine and dot product are also supported -- cosine
+//! specifically matters in practice, not just as a checkbox: most
+//! modern text embedding models (OpenAI's, most open-source ones) are
+//! trained to be compared by direction, not raw Euclidean distance, so
+//! using L2 against them is closer to a correctness gap than a stylistic
+//! preference.
 //!
 //! Reference: Malkov & Yashunin, "Efficient and robust approximate
 //! nearest neighbor search using Hierarchical Navigable Small World
@@ -23,6 +31,52 @@
 use rand::Rng;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
+
+/// Which distance function an index was built and must be queried with.
+/// Mixing metrics between build and search would silently produce
+/// meaningless results -- there's no type-level way to prevent that
+/// mismatch, but `HnswParams` stores this once at build time and the
+/// same value is used consistently for every distance computation in
+/// the index afterward (see `HnswIndex::params`), so the only way to
+/// get it wrong is to build two separate indexes with different metrics
+/// and mix up which one a query is sent to -- a caller-side mistake,
+/// not something this module can fully guard against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DistanceMetric {
+    /// Squared Euclidean distance. Smaller = closer. The default.
+    L2,
+    /// 1 - cosine similarity. Smaller = closer (identical direction is
+    /// 0). Undefined for a zero vector (no direction) -- returns 1.0
+    /// (the midpoint of the 0-2 range) rather than dividing by zero or
+    /// propagating NaN into the graph.
+    Cosine,
+    /// Negative dot product (inner product). Smaller = closer, meaning
+    /// *more negative* is more similar -- this deliberately inverts the
+    /// natural "higher inner product = more similar" convention so dot
+    /// product fits the same "smaller distance = closer" assumption
+    /// every other part of this module (the min-heap search frontier,
+    /// the candidate ordering) is built around, instead of needing a
+    /// second, parallel maximization code path throughout the graph
+    /// traversal logic.
+    ///
+    /// **A real, non-obvious property worth knowing, found via a test
+    /// that failed for the right reason rather than a wrong one**: unlike
+    /// L2 or cosine, a vector's dot product with *itself* is not
+    /// guaranteed to be its own nearest neighbor. Dot product rewards
+    /// magnitude as well as direction (`v . v = ||v||^2`), so a different
+    /// vector with larger magnitude and reasonable alignment can produce
+    /// a *higher* dot product than a vector's self-similarity -- this is
+    /// a known property of Maximum Inner Product Search (MIPS), not a
+    /// bug. If you need "a vector always finds itself" as an invariant,
+    /// L2 or cosine are the right metrics, not dot product.
+    DotProduct,
+}
+
+impl Default for DistanceMetric {
+    fn default() -> Self {
+        DistanceMetric::L2
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct HnswParams {
@@ -34,6 +88,12 @@ pub struct HnswParams {
     /// Candidate list size during construction. Higher = better graph
     /// quality (recall), slower build.
     pub ef_construction: usize,
+    /// Which distance function this index was built with. Stored here
+    /// (not as a separate parameter threaded everywhere) so it
+    /// naturally travels wherever `HnswParams` already does -- including
+    /// `Engine::compact()`'s index rebuild, which reuses whatever params
+    /// were last used rather than silently reverting to defaults.
+    pub metric: DistanceMetric,
 }
 
 impl Default for HnswParams {
@@ -42,7 +102,7 @@ impl Default for HnswParams {
         // baseline benchmarks (bench/scripts/bench_pgvector.py,
         // bench_milvus.py) so NeuraStore's index is tuned comparably,
         // not given an unfair advantage via looser parameters.
-        Self { m: 16, m_max0: 32, ef_construction: 64 }
+        Self { m: 16, m_max0: 32, ef_construction: 64, metric: DistanceMetric::L2 }
     }
 }
 
@@ -93,6 +153,41 @@ impl Ord for MinCandidate {
 fn squared_l2(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len(), "vector dimension mismatch");
     a.iter().zip(b.iter()).map(|(x, y)| (x - y) * (x - y)).sum()
+}
+
+fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "vector dimension mismatch");
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 {
+        // A zero vector has no direction, so cosine similarity is
+        // undefined -- returning 1.0 (the midpoint of the [0, 2] range,
+        // equivalent to "orthogonal") is a safe, documented choice
+        // rather than dividing by zero or letting NaN reach the graph,
+        // where it would silently break the min-heap ordering search
+        // relies on throughout.
+        return 1.0;
+    }
+    1.0 - (dot / (norm_a * norm_b))
+}
+
+fn negative_dot_product(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "vector dimension mismatch");
+    -a.iter().zip(b.iter()).map(|(x, y)| x * y).sum::<f32>()
+}
+
+/// Single entry point every distance computation in this module goes
+/// through -- dispatches to the configured metric rather than any call
+/// site picking a distance function directly, so build and search are
+/// structurally guaranteed to agree on which metric is in use for a
+/// given index.
+fn distance(a: &[f32], b: &[f32], metric: DistanceMetric) -> f32 {
+    match metric {
+        DistanceMetric::L2 => squared_l2(a, b),
+        DistanceMetric::Cosine => cosine_distance(a, b),
+        DistanceMetric::DotProduct => negative_dot_product(a, b),
+    }
 }
 
 struct Node {
@@ -154,6 +249,24 @@ impl HnswIndex {
     pub fn vector(&self, internal_id: usize) -> &[f32] {
         let start = internal_id * self.dim;
         &self.vectors[start..start + self.dim]
+    }
+
+    /// Distance from `query` to a stored vector, using this index's
+    /// configured metric -- the method callers outside this module
+    /// (specifically `VectorIndex`'s brute-force filtered-search path)
+    /// should use instead of computing L2 inline themselves. Before
+    /// this existed, that path had its own hardcoded squared-L2
+    /// computation, completely independent of the graph-traversal
+    /// path's metric -- meaning unfiltered search would correctly use
+    /// a configured cosine/dot-product metric while filtered search on
+    /// the *same index* silently stayed L2 forever. Found and fixed
+    /// while adding metric support, not after shipping it.
+    pub fn distance_to(&self, query: &[f32], internal_id: usize) -> f32 {
+        distance(query, self.vector(internal_id), self.params.metric)
+    }
+
+    pub fn metric(&self) -> DistanceMetric {
+        self.params.metric
     }
 
     fn random_level(&self, rng: &mut impl Rng) -> usize {
@@ -243,7 +356,7 @@ impl HnswIndex {
             let node_vec = self.vector(node_id).to_vec();
             let mut scored: Vec<(usize, f32)> = neighbors
                 .iter()
-                .map(|&id| (id, squared_l2(&node_vec, self.vector(id))))
+                .map(|&id| (id, distance(&node_vec, self.vector(id), self.params.metric)))
                 .collect();
             scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
             scored.truncate(m_max);
@@ -286,7 +399,7 @@ impl HnswIndex {
         let mut visited: HashSet<usize> = HashSet::new();
         visited.insert(entry);
 
-        let entry_dist = squared_l2(query, self.vector(entry));
+        let entry_dist = distance(query, self.vector(entry), self.params.metric);
         let mut candidates: BinaryHeap<MinCandidate> =
             BinaryHeap::from([MinCandidate(Candidate { dist: entry_dist, id: entry })]);
         let mut results: BinaryHeap<Candidate> = BinaryHeap::new();
@@ -316,7 +429,7 @@ impl HnswIndex {
             }
             for &neighbor_id in &self.nodes[current.id].neighbors[layer] {
                 if visited.insert(neighbor_id) {
-                    let dist = squared_l2(query, self.vector(neighbor_id));
+                    let dist = distance(query, self.vector(neighbor_id), self.params.metric);
                     // Always explore through the neighbor (push to the
                     // frontier) regardless of whether it matches --
                     // it may be the only path to a matching node deeper
@@ -388,7 +501,7 @@ impl HnswIndex {
     /// the approximate `search` above. O(n) per query -- reference only.
     pub fn brute_force(&self, query: &[f32], k: usize) -> Vec<(usize, f32)> {
         let mut scored: Vec<(usize, f32)> = (0..self.count)
-            .map(|id| (id, squared_l2(query, self.vector(id))))
+            .map(|id| (id, distance(query, self.vector(id), self.params.metric)))
             .collect();
         scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
         scored.truncate(k);
@@ -563,5 +676,189 @@ mod tests {
         let low = recall_for_ef(10);
         let high = recall_for_ef(100);
         assert!(high >= low - 0.05, "higher ef_search recall ({high}) should not be much worse than low ef_search ({low})");
+    }
+
+    // -- Distance metric tests -----------------------------------------
+
+    #[test]
+    fn l2_and_cosine_disagree_on_same_direction_different_magnitude() {
+        // The whole reason cosine exists as an option: two vectors
+        // pointing in the exact same direction but with very different
+        // magnitudes are "close" under cosine (same direction) but "far"
+        // under L2 (large magnitude difference). If both metrics agreed
+        // here, cosine wouldn't be doing anything different from L2.
+        let a = vec![1.0, 0.0];
+        let b = vec![10.0, 0.0]; // same direction as a, 10x the magnitude
+
+        let l2 = squared_l2(&a, &b);
+        let cos = cosine_distance(&a, &b);
+
+        assert!(l2 > 1.0, "L2 should see these as far apart (magnitude differs a lot): got {l2}");
+        assert!(cos < 0.01, "cosine should see these as nearly identical (same direction): got {cos}");
+    }
+
+    #[test]
+    fn cosine_distance_is_zero_for_identical_direction() {
+        let a = vec![3.0, 4.0];
+        let b = vec![6.0, 8.0]; // exactly 2x a, same direction
+        let dist = cosine_distance(&a, &b);
+        assert!(dist.abs() < 1e-5, "identical direction should give ~0 cosine distance, got {dist}");
+    }
+
+    #[test]
+    fn cosine_distance_is_two_for_opposite_direction() {
+        let a = vec![1.0, 0.0];
+        let b = vec![-1.0, 0.0];
+        let dist = cosine_distance(&a, &b);
+        assert!((dist - 2.0).abs() < 1e-5, "exactly opposite direction should give cosine distance 2.0, got {dist}");
+    }
+
+    #[test]
+    fn cosine_distance_handles_zero_vector_without_panicking_or_nan() {
+        let zero = vec![0.0, 0.0];
+        let other = vec![1.0, 1.0];
+        let dist = cosine_distance(&zero, &other);
+        assert!(dist.is_finite(), "zero-vector cosine distance must be a real number, not NaN/inf");
+        assert_eq!(dist, 1.0, "documented convention: undefined direction treated as distance 1.0 (orthogonal-equivalent)");
+    }
+
+    #[test]
+    fn dot_product_rewards_magnitude_unlike_cosine() {
+        // Dot product similarity (unlike cosine) is NOT direction-only --
+        // a same-direction vector with larger magnitude has a LARGER dot
+        // product (= more negative "distance" under our convention, i.e.
+        // ranked as closer) than a same-direction smaller one. This is
+        // the actual behavioral difference between the two metrics worth
+        // proving, not just that both compile.
+        let query = vec![1.0, 0.0];
+        let small = vec![1.0, 0.0]; // same direction, magnitude 1
+        let large = vec![5.0, 0.0]; // same direction, magnitude 5
+
+        let dist_small = negative_dot_product(&query, &small);
+        let dist_large = negative_dot_product(&query, &large);
+
+        assert!(dist_large < dist_small, "larger same-direction magnitude should rank closer under dot product (more negative distance): small={dist_small}, large={dist_large}");
+    }
+
+    #[test]
+    fn distance_dispatch_matches_direct_function_calls_for_each_metric() {
+        let a = vec![1.0, 2.0, 3.0];
+        let b = vec![4.0, 5.0, 6.0];
+        assert_eq!(distance(&a, &b, DistanceMetric::L2), squared_l2(&a, &b));
+        assert_eq!(distance(&a, &b, DistanceMetric::Cosine), cosine_distance(&a, &b));
+        assert_eq!(distance(&a, &b, DistanceMetric::DotProduct), negative_dot_product(&a, &b));
+    }
+
+    #[test]
+    fn default_hnsw_params_use_l2_for_backward_compatibility() {
+        assert_eq!(HnswParams::default().metric, DistanceMetric::L2, "changing the default metric would silently change every existing benchmark and stored index's behavior");
+    }
+
+    #[test]
+    fn hnsw_index_built_with_cosine_metric_finds_itself() {
+        // Same self-lookup guarantee as the existing L2 test
+        // (self_lookup_succeeds_on_well_separated_points), but for cosine
+        // -- proves the whole graph construction/search machinery, not
+        // just the raw distance function, works correctly under a
+        // different metric.
+        let mut rng = StdRng::seed_from_u64(1);
+        let params = HnswParams { metric: DistanceMetric::Cosine, ..HnswParams::default() };
+        let mut index = HnswIndex::new(params);
+        let vectors = clustered_vectors(50, 8, 5, 7);
+        for v in &vectors {
+            index.insert(v.clone(), &mut rng);
+        }
+        for (i, v) in vectors.iter().enumerate() {
+            let results = index.search(v, 1, 50);
+            assert_eq!(results[0].0, i, "vector {i} should find itself as its own nearest neighbor under cosine metric");
+            assert!(results[0].1 < 1e-4, "self-distance under cosine should be ~0, got {}", results[0].1);
+        }
+    }
+
+    #[test]
+    fn hnsw_index_built_with_dot_product_metric_matches_brute_force_ground_truth() {
+        // NOT a "finds itself" test -- see DistanceMetric::DotProduct's
+        // doc comment for why that assumption is actually wrong for this
+        // metric (confirmed by an earlier version of this test failing
+        // for the right reason: a real mathematical property of Maximum
+        // Inner Product Search, not a bug). The correct guarantee to test
+        // is that the approximate graph search agrees with exact
+        // brute-force search under the same metric -- the same standard
+        // this project holds L2 and cosine to.
+        let mut rng = StdRng::seed_from_u64(2);
+        let params = HnswParams { metric: DistanceMetric::DotProduct, ..HnswParams::default() };
+        let mut index = HnswIndex::new(params);
+        let vectors = clustered_vectors(50, 8, 5, 9);
+        for v in &vectors {
+            index.insert(v.clone(), &mut rng);
+        }
+        let queries = clustered_vectors(15, 8, 5, 20);
+        let mut recalls = Vec::new();
+        for q in &queries {
+            let approx = index.search(q, 5, 100);
+            let exact = index.brute_force(q, 5);
+            recalls.push(recall_at_k(&approx, &exact, 5));
+        }
+        let avg_recall = recalls.iter().sum::<f64>() / recalls.len() as f64;
+        assert!(avg_recall > 0.8, "dot-product search should still achieve reasonable recall against its own ground truth: got {avg_recall}");
+    }
+
+    #[test]
+    fn brute_force_respects_configured_metric_not_hardcoded_l2() {
+        // Regression guard for the exact bug shape found while adding
+        // metric support: brute_force must use self.params.metric, not
+        // a hardcoded squared_l2 call, or it stops being a valid ground
+        // truth for recall testing against a non-L2 index.
+        let mut rng = StdRng::seed_from_u64(3);
+        let params = HnswParams { metric: DistanceMetric::Cosine, ..HnswParams::default() };
+        let mut index = HnswIndex::new(params);
+        let a = vec![1.0, 0.0];
+        let b = vec![10.0, 0.0]; // same direction, far in L2, near in cosine
+        let c = vec![0.0, 1.0];  // orthogonal to a
+        index.insert(a.clone(), &mut rng);
+        index.insert(b.clone(), &mut rng);
+        index.insert(c.clone(), &mut rng);
+
+        let results = index.brute_force(&a, 3);
+        // Under cosine, b (same direction) should rank closer than c
+        // (orthogonal), even though b is far from a in raw L2 terms.
+        let b_rank = results.iter().position(|(id, _)| *id == 1).unwrap();
+        let c_rank = results.iter().position(|(id, _)| *id == 2).unwrap();
+        assert!(b_rank < c_rank, "under cosine metric, same-direction vector b should rank closer than orthogonal vector c");
+    }
+
+    #[test]
+    fn cosine_and_l2_produce_different_rankings_on_the_same_data() {
+        // The end-to-end proof that metric choice actually changes
+        // search results, not just an internal distance number: build
+        // TWO indexes on the same data with different metrics, search
+        // with the same query, and confirm the result ORDER differs.
+        let mut rng_l2 = StdRng::seed_from_u64(4);
+        let mut rng_cos = StdRng::seed_from_u64(4);
+        let data = vec![
+            vec![1.0, 0.0],   // id 0: same direction as query, small magnitude
+            vec![20.0, 0.0],  // id 1: same direction as query, large magnitude
+            vec![0.9, 0.1],   // id 2: close to query in raw L2 terms, slightly off-direction
+        ];
+        let query = vec![1.0, 0.0];
+
+        let mut l2_index = HnswIndex::new(HnswParams::default());
+        let mut cos_index = HnswIndex::new(HnswParams { metric: DistanceMetric::Cosine, ..HnswParams::default() });
+        for v in &data {
+            l2_index.insert(v.clone(), &mut rng_l2);
+            cos_index.insert(v.clone(), &mut rng_cos);
+        }
+
+        let l2_top1 = l2_index.search(&query, 1, 50)[0].0;
+        let cos_top1 = cos_index.search(&query, 1, 50)[0].0;
+
+        // L2's nearest neighbor to [1,0] should be id 0 (itself, closest
+        // in raw distance) or id 2 (also close in raw terms) -- id 1
+        // (magnitude 20) should be far under L2.
+        assert_ne!(l2_top1, 1, "L2 should not rank the large-magnitude same-direction vector as nearest");
+        // Under cosine, id 0 and id 1 are BOTH exactly on-direction (cosine
+        // distance 0 to the query) -- either is a valid top-1, unlike L2
+        // which must prefer the magnitude-matched one.
+        assert!(cos_top1 == 0 || cos_top1 == 1, "cosine's nearest neighbor should be one of the two exactly-on-direction vectors, got {cos_top1}");
     }
 }

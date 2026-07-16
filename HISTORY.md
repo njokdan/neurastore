@@ -948,3 +948,153 @@ verified against a real GitHub Actions run from this environment (no
 way to trigger one from here) — flag anything that doesn't work as
 written, same honest caveat as the original Dockerfile before it was
 verified.
+
+## Status: Phase 9 — Distance Metrics (complete)
+
+The first of the honest competitive gaps named in `COMPARISON.md`'s
+head-to-head against Pinecone/Milvus/pgvector: squared L2 was the
+*only* distance metric available, full stop. Cosine similarity and dot
+product (inner product) are now supported alongside it, selectable per
+index build. This wasn't a checkbox feature — cosine specifically
+matters in practice, since most modern text embedding models (OpenAI's,
+most open-source ones) are trained to be compared by direction, not raw
+Euclidean distance. Using L2 against them was closer to a correctness
+gap than a stylistic limitation.
+
+**Design**: `DistanceMetric` (`L2`, `Cosine`, `DotProduct`) is stored on
+`HnswParams`, the same struct `Engine::compact()` already reused to
+avoid silently reverting a rebuilt index to default parameters — metric
+selection gets that same guarantee for free, not as a separate
+mechanism. Every distance computation in the codebase routes through a
+single dispatch function, `distance(a, b, metric)`, rather than call
+sites picking a distance function directly — this is what makes build
+and search structurally guaranteed to agree on which metric is in use.
+
+**A real bug found and fixed during this work, not after shipping it**:
+the filtered-search brute-force path (Phase 4's fallback for highly
+selective filters) had its own *separate*, hardcoded squared-L2
+computation, completely independent of the graph-traversal path. Before
+this was caught, unfiltered search on a cosine-built index would have
+correctly used cosine, while filtered search on the *same index* would
+have silently stayed L2 forever — a real, serious correctness bug
+between two code paths on the same index. Fixed by routing both through
+the same `HnswIndex::distance_to()` accessor.
+
+**A real, non-obvious property discovered by a test failing for the
+right reason**: dot product does not guarantee a vector finds itself as
+its own nearest neighbor, unlike L2 or cosine. Dot product rewards
+magnitude as well as direction (`v . v = ||v||^2`), so a different
+vector with larger magnitude and reasonable alignment can produce a
+*higher* dot product than a vector's self-similarity. This is a known
+property of Maximum Inner Product Search (MIPS), not a bug — an
+initial test assumed "finds itself" should hold universally across all
+three metrics, and a real failure (verified independently against a
+Python/NumPy reference before touching the Rust code) caught the wrong
+assumption. Documented directly on `DistanceMetric::DotProduct` so it
+isn't mistaken for a regression later.
+
+**HTTP API**: `POST /v1/index/build` now optionally accepts
+`{"metric": "l2" | "cosine" | "dot_product"}`. Backward compatibility
+was a real design constraint, not an afterthought — every existing
+caller sends this endpoint zero body at all, and axum's `Json<T>`
+extractor would reject a missing body outright. Fixed by accepting raw
+`Bytes` and treating an empty body as the L2 default, only attempting
+JSON parsing when a body is actually present.
+
+**Tested**: 11 new library tests (including the corrected dot-product
+test, and a regression guard specifically for the brute-force-path bug)
+plus 4 new server tests, including one that proves the metric choice
+changes real search rankings end-to-end over actual HTTP, not just
+internally. 6 new client-side tests (Python client + CLI). 120 Rust
+tests total (74 library, 46 server), 58 Python client-side tests.
+
+**Verified live**, not just in the test harness: inserted three real
+vectors (same direction, very different magnitudes, plus one close in
+raw L2 terms), built with L2 (vector at magnitude 20 ranked farthest,
+distance 361 — matching the exact expected squared difference), rebuilt
+the same data with cosine (that same vector became one of the two
+*closest* results, tied at distance 0.0) — a clean, textbook
+demonstration of exactly why this capability matters, confirmed with
+real HTTP requests and the actual installed CLI binary, not simulated.
+
+## Status: Phase 10 — Richer Metadata Types (complete)
+
+The second competitive gap from `COMPARISON.md`'s honest head-to-head:
+metadata was string-only, meaning filtering could only ever be
+exact-match equality on text. No numeric range queries ("price > 100"),
+no boolean flags. Numbers and booleans are now first-class metadata
+types, alongside strings, with range comparisons (`gt`/`gte`/`lt`/`lte`)
+for numeric fields.
+
+**A real, deliberate breaking change, stated plainly rather than
+hidden**: this changes the on-disk binary format for stored metadata.
+Existing SSTable files written before this change do not deserialize
+correctly afterward. Made now, not later, specifically because
+NeuraStore has no real production deployments yet — this is the right
+time to make a storage-format change, before anyone has real data
+depending on the old one.
+
+**A real, load-bearing discovery made by testing before writing the
+rest of the system around an untested assumption**: the natural design
+for JSON-friendly typed metadata was a `#[serde(untagged)]` enum (so
+JSON looks like `"docs"`, `29.99`, `true` instead of a tagged wrapper).
+Verified empirically before committing to it: an untagged enum
+serializes fine via bincode but **fails on every single deserialize**
+with `DeserializeAnyNotSupported`, because bincode is a
+non-self-describing format and untagged deserialization needs to try
+each variant in turn against the byte stream, which a sequential reader
+structurally cannot do. Caught with a five-line standalone test before
+any of the rest of this phase was built on top of the wrong assumption.
+Fixed by keeping the internal `MetadataValue` a normal tagged enum
+(bincode-correct) and doing the untagged-JSON conversion explicitly at
+the HTTP boundary instead, where it belongs.
+
+**Design**: `MetadataValue` (`String`, `Number(f64)`, `Bool`) replaces
+the old `HashMap<String, String>` metadata type throughout the storage
+and index layers. The existing per-field inverted index (`field_index`,
+built for string-only equality lookups) keeps working for equality
+against *any* type via a type-tagged canonical string key — deliberately
+tested directly: the string `"42"` and the number `42` must never
+collide just because they'd stringify to the same text, and a dedicated
+test proves they don't. Range queries reuse the HNSW search layer's
+existing general predicate closure (`Fn(usize) -> bool`) almost for
+free — it already supported arbitrary predicates, not just materialized
+candidate lists, so no new graph-traversal plumbing was needed. **A
+deliberate, documented scope boundary**: only equality gets the fast
+selective-candidate path via `field_index`; range queries always go
+through graph traversal, since there's no sorted numeric index yet for
+efficient range candidate generation. Correct, just without that extra
+optimization for now — a reasonable place to stop for this pass, not an
+oversight.
+
+**HTTP API**: `POST /v1/search/filtered` gained an optional `op` field
+(`"eq"` default, or `"gt"`/`"gte"`/`"lt"`/`"lte"`) — omitting it entirely
+preserves the exact pre-Phase-10 request shape and behavior. `PutRequest`
+and batch insert now accept natural JSON values (`"docs"`, `29.99`,
+`true`) for metadata instead of forcing everything through strings;
+arrays, nested objects, and null get a clear 400 instead of silent
+coercion or a panic.
+
+**Tested**: 8 new library tests (including the string/number
+canonical-key collision guard and a range query exercised through the
+broad graph-traversal path specifically, not just the trivial case) and
+6 new server tests (typed insert/retrieve over HTTP, range queries
+end-to-end, explicit backward-compatibility confirmation with the old
+no-`op` request shape, and two error-handling cases). 6 new client-side
+tests (typed metadata serialization, the `op` parameter, and CLI type
+inference from plain-text `key=value` pairs). 134 Rust tests total (82
+library, 52 server), 63 Python client-side tests.
+
+**Verified live end-to-end, not just in the test harness**: inserted
+records with mixed string/number/bool metadata over real HTTP, fetched
+them back and confirmed the types round-tripped as natural JSON (not
+stringified), ran a real numeric range filter and a real boolean filter
+and confirmed correct results, confirmed the pre-Phase-10 request shape
+still works unchanged, confirmed a range op against a non-numeric field
+returns a clear error instead of silently matching nothing or crashing
+— and, critically, **killed the server process and restarted it against
+the same data directory**, confirming the new tagged-enum storage
+format survives a real disk round-trip through the actual WAL/SSTable
+pipeline, not just an in-memory session. Repeated the full workflow
+again through the actual installed CLI binary with identical results.
+

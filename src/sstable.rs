@@ -19,7 +19,7 @@
 //! of scanning, and is a precondition for range scans and compaction
 //! merges later.
 
-use crate::record::{Record, RecordId};
+use crate::record::{MetadataValue, Record, RecordId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -174,7 +174,7 @@ impl SSTableReader {
     }
 
     fn reconstruct(&self, entry: &IndexEntry) -> Record {
-        let metadata: HashMap<String, String> = if entry.meta_len == 0 {
+        let metadata: HashMap<String, MetadataValue> = if entry.meta_len == 0 {
             HashMap::new()
         } else {
             let start = entry.meta_offset as usize;
@@ -207,7 +207,7 @@ mod tests {
         Record::new(
             id,
             (0..dim).map(|i| (id as f32) + (i as f32) * 0.1).collect(),
-            StdHashMap::from([("category".to_string(), format!("cat{}", id % 3))]),
+            StdHashMap::from([("category".to_string(), MetadataValue::String(format!("cat{}", id % 3)))]),
             seq,
         )
     }
@@ -225,7 +225,7 @@ mod tests {
         let r = reader.get(25).unwrap();
         assert_eq!(r.id, 25);
         assert_eq!(r.vector.len(), 8);
-        assert_eq!(r.metadata.get("category").unwrap(), "cat1");
+        assert_eq!(r.metadata.get("category").unwrap(), &MetadataValue::String("cat1".to_string()));
     }
 
     #[test]

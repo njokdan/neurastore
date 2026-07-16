@@ -20,7 +20,7 @@ Design choices worth knowing about:
   needing to know NeuraStore's status code conventions.
 """
 import struct
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Union
 
 import requests
 
@@ -35,6 +35,13 @@ from .exceptions import (
 from .models import Record, SearchResult, Stats
 
 _BINARY_MAGIC = b"NSBB"
+
+# A metadata field's value: string, number (int or float -- the server
+# stores both as f64), or bool. Matches the server's MetadataValue enum
+# (record.rs) -- Phase 10 extended metadata beyond string-only. Arrays,
+# nested objects, and null are not supported; the server returns a clear
+# 400 if you try, rather than silently coercing or dropping them.
+MetadataValue = Union[str, int, float, bool]
 
 
 class NeuraStoreClient:
@@ -136,14 +143,19 @@ class NeuraStoreClient:
         self,
         id: int,
         vector: Sequence[float],
-        metadata: Optional[Dict[str, str]] = None,
+        metadata: Optional[Dict[str, MetadataValue]] = None,
         collection: str = "default",
     ) -> None:
         """Insert or update a single record. Re-using an existing `id` is
         an update, not an error -- the old vector/metadata is replaced.
         `collection` addresses a named collection (created lazily on
         first write); omit it to use the default collection, exactly as
-        before multi-collection support existed."""
+        before multi-collection support existed.
+
+        `metadata` values can be strings, numbers, or booleans:
+            client.insert(1, [0.1, 0.2], metadata={"category": "docs", "price": 29.99, "in_stock": True})
+        Arrays and nested objects aren't supported -- the server returns
+        a clear error rather than silently dropping or coercing them."""
         body = {"id": id, "vector": list(vector), "metadata": metadata or {}}
         self._request("POST", self._collection_path(collection, "/records"), json=body)
 
@@ -199,14 +211,27 @@ class NeuraStoreClient:
         doesn't exist -- matches the server's own delete semantics."""
         self._request("DELETE", self._collection_path(collection, f"/records/{id}"))
 
-    def build_index(self, collection: str = "default") -> None:
+    def build_index(self, collection: str = "default", metric: Optional[str] = None) -> None:
         """Build (or rebuild) the vector index from all currently live
         records. Required before `search()`/`search_filtered()` will
         work -- calling it again later is optional, not required for
         correctness (writes made after the first `build_index()` call
         are kept in sync automatically), but can help reclaim space from
-        accumulated soft-deletes."""
-        self._request("POST", self._collection_path(collection, "/index/build"))
+        accumulated soft-deletes.
+
+        `metric` selects the distance function: `"l2"` (squared
+        Euclidean, the default if omitted), `"cosine"`, or
+        `"dot_product"`. Cosine matters in practice, not just as an
+        option to have: most modern text embedding models (OpenAI's,
+        most open-source ones) are trained to be compared by direction,
+        not raw Euclidean distance, so using L2 against them is closer
+        to a correctness gap than a stylistic preference. Note: dot
+        product does not guarantee a vector finds itself as its nearest
+        neighbor (it rewards magnitude as well as direction) -- use L2
+        or cosine if that invariant matters for your use case.
+        """
+        body = {"metric": metric} if metric is not None else None
+        self._request("POST", self._collection_path(collection, "/index/build"), json=body)
 
     def compact(self, collection: str = "default") -> None:
         """Reclaims space accumulated from deletes and updates -- merges
@@ -245,18 +270,28 @@ class NeuraStoreClient:
         self,
         vector: Sequence[float],
         field: str,
-        value: str,
+        value: MetadataValue,
+        op: str = "eq",
         k: int = 10,
         ef_search: int = 40,
         collection: str = "default",
     ) -> List[SearchResult]:
-        """k-NN search restricted to records where `metadata[field] ==
-        value`. The predicate is pushed into the search itself (or
+        """k-NN search restricted to records matching a predicate on
+        `field`. The predicate is pushed into the search itself (or
         answered by exact brute-force computation for highly selective
         filters), not applied by discarding an unfiltered result set
         after fetching it -- see the main NeuraStore repo's README for
-        why that distinction is the whole point of this method existing."""
-        body = {"vector": list(vector), "k": k, "ef_search": ef_search, "field": field, "value": value}
+        why that distinction is the whole point of this method existing.
+
+        `op` is `"eq"` (default -- works against any metadata type) or
+        `"gt"`/`"gte"`/`"lt"`/`"lte"` for numeric range queries against
+        a number field:
+            client.search_filtered(vec, field="category", value="docs")
+            client.search_filtered(vec, field="price", value=100, op="gte")
+        Range ops only ever have a fast path via the graph traversal,
+        not the selective-candidate shortcut equality gets -- correct
+        either way, just without that extra optimization for now."""
+        body = {"vector": list(vector), "k": k, "ef_search": ef_search, "field": field, "op": op, "value": value}
         response = self._request("POST", self._collection_path(collection, "/search/filtered"), json=body)
         return [SearchResult._from_json(r) for r in response.json()["results"]]
 

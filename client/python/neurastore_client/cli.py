@@ -41,13 +41,40 @@ def _parse_vector(s: str) -> List[float]:
         )
 
 
-def _parse_metadata(pairs: List[str]) -> Dict[str, str]:
+def _infer_typed_value(raw: str):
+    """Infers a value's type from its plain-text command-line form:
+    "true"/"false" (case-insensitive) become bool, anything parseable as
+    a number becomes int or float, everything else stays a string. A
+    CLI-only convenience -- the HTTP API itself takes real JSON types
+    directly (via the Python client or a raw request); this is just how
+    to spell numbers and booleans on a command line, where everything
+    starts out as a string. If you genuinely need the literal string
+    "true" or "42" as a value rather than the typed form, use the Python
+    client directly instead of the CLI.
+    """
+    lowered = raw.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    try:
+        return int(raw)
+    except ValueError:
+        pass
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    return raw
+
+
+def _parse_metadata(pairs: List[str]) -> Dict[str, object]:
     metadata = {}
     for pair in pairs or []:
         if "=" not in pair:
             raise argparse.ArgumentTypeError(f"invalid metadata {pair!r} -- expected key=value")
         key, _, value = pair.partition("=")
-        metadata[key] = value
+        metadata[key] = _infer_typed_value(value)
     return metadata
 
 
@@ -106,7 +133,13 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("delete", help="soft-delete a record by id")
     p.add_argument("--id", type=int, required=True)
 
-    sub.add_parser("build-index", help="build (or rebuild) the vector index")
+    p = sub.add_parser("build-index", help="build (or rebuild) the vector index")
+    p.add_argument(
+        "--metric",
+        choices=["l2", "cosine", "dot_product"],
+        default=None,
+        help="distance metric (default: l2, matches server default if omitted)",
+    )
     sub.add_parser("compact", help="reclaim space from deleted/superseded records (merges storage, rebuilds index if one exists)")
 
     p = sub.add_parser("search", help="unfiltered k-NN search")
@@ -114,10 +147,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--k", type=int, default=10)
     p.add_argument("--ef-search", type=int, default=40)
 
-    p = sub.add_parser("search-filtered", help="k-NN search restricted to metadata[field] == value")
+    p = sub.add_parser("search-filtered", help="k-NN search restricted to a predicate on one metadata field")
     p.add_argument("--vector", type=_parse_vector, required=True)
     p.add_argument("--field", required=True)
-    p.add_argument("--value", required=True)
+    p.add_argument("--value", required=True, help="e.g. docs, 29.99, or true -- type is inferred (see --op for range queries)")
+    p.add_argument("--op", default="eq", choices=["eq", "gt", "gte", "lt", "lte"], help="comparison operator (default: eq)")
     p.add_argument("--k", type=int, default=10)
     p.add_argument("--ef-search", type=int, default=40)
 
@@ -174,8 +208,8 @@ def run(args: argparse.Namespace) -> int:
             return 0
 
         if args.command == "build-index":
-            client.build_index(collection=args.collection)
-            print("index built")
+            client.build_index(collection=args.collection, metric=args.metric)
+            print(f"index built (metric: {args.metric or 'l2'})")
             return 0
 
         if args.command == "compact":
@@ -190,7 +224,13 @@ def run(args: argparse.Namespace) -> int:
 
         if args.command == "search-filtered":
             results = client.search_filtered(
-                args.vector, field=args.field, value=args.value, k=args.k, ef_search=args.ef_search, collection=args.collection
+                args.vector,
+                field=args.field,
+                value=_infer_typed_value(args.value),
+                op=args.op,
+                k=args.k,
+                ef_search=args.ef_search,
+                collection=args.collection,
             )
             _print_results(results, args.json)
             return 0

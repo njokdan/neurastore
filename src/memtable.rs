@@ -93,7 +93,7 @@ impl MemTable {
             + record
                 .metadata
                 .iter()
-                .map(|(k, v)| k.len() + v.len())
+                .map(|(k, v)| k.len() + v.approx_size())
                 .sum::<usize>()
     }
 }

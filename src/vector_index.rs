@@ -28,7 +28,7 @@
 //!   a small candidate set directly is cheaper than a graph search.
 
 use crate::hnsw::{HnswIndex, HnswParams};
-use crate::record::{Record, RecordId};
+use crate::record::{MetadataValue, Record, RecordId};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use std::cmp::Ordering;
@@ -79,6 +79,34 @@ const BRUTE_FORCE_THRESHOLD: usize = 3_000;
 /// mechanism this bounds.
 const MAX_FILTERED_VISITS: usize = 20_000;
 
+/// A filtered-search predicate against one metadata field. `Eq` works
+/// against any `MetadataValue` type (string, number, or bool) and can
+/// use the fast selective-candidate path via `field_index`. The range
+/// comparisons only make sense against `MetadataValue::Number` fields --
+/// applied against a String or Bool field, they simply never match
+/// (via `MetadataValue::as_number()` returning `None`), rather than
+/// panicking or silently coercing.
+#[derive(Debug, Clone)]
+pub enum FilterOp {
+    Eq(MetadataValue),
+    Gt(f64),
+    Gte(f64),
+    Lt(f64),
+    Lte(f64),
+}
+
+impl FilterOp {
+    fn matches(&self, value: &MetadataValue) -> bool {
+        match self {
+            FilterOp::Eq(target) => value == target,
+            FilterOp::Gt(threshold) => value.as_number().map(|n| n > *threshold).unwrap_or(false),
+            FilterOp::Gte(threshold) => value.as_number().map(|n| n >= *threshold).unwrap_or(false),
+            FilterOp::Lt(threshold) => value.as_number().map(|n| n < *threshold).unwrap_or(false),
+            FilterOp::Lte(threshold) => value.as_number().map(|n| n <= *threshold).unwrap_or(false),
+        }
+    }
+}
+
 pub struct VectorIndex {
     hnsw: HnswIndex,
     /// internal HNSW node id -> RecordId. Grows by one on every
@@ -87,7 +115,7 @@ pub struct VectorIndex {
     /// internal HNSW node id -> metadata, parallel to `id_map`. Phase 4:
     /// what makes filtered search possible without going back to the
     /// engine's storage layer for every candidate.
-    metadata: Vec<HashMap<String, String>>,
+    metadata: Vec<HashMap<String, MetadataValue>>,
     /// external RecordId -> its CURRENT live internal node id. An
     /// update (re-insert of an existing RecordId) changes this mapping
     /// and tombstones the previous internal id.
@@ -155,7 +183,7 @@ impl VectorIndex {
     /// see module docs). Returns `true` if inserted/updated, `false` if
     /// skipped (empty vector, or dimension mismatch against whatever the
     /// index's dimension was first established as).
-    pub fn insert(&mut self, id: RecordId, vector: &[f32], metadata: &HashMap<String, String>) -> bool {
+    pub fn insert(&mut self, id: RecordId, vector: &[f32], metadata: &HashMap<String, MetadataValue>) -> bool {
         if vector.is_empty() {
             return false;
         }
@@ -182,7 +210,7 @@ impl VectorIndex {
             self.field_index
                 .entry(field.clone())
                 .or_default()
-                .entry(value.clone())
+                .entry(value.canonical_key())
                 .or_default()
                 .push(new_internal);
         }
@@ -231,9 +259,11 @@ impl VectorIndex {
     }
 
     /// Approximate k-NN search, translated back to RecordIds, with
-    /// tombstoned (deleted or superseded) nodes filtered out. Distances
-    /// returned are squared L2, matching the pgvector/Milvus baseline
-    /// metric.
+    /// tombstoned (deleted or superseded) nodes filtered out. Distance
+    /// units depend on the index's configured metric (see
+    /// `HnswIndex::metric()`) -- squared L2 by default, matching the
+    /// pgvector/Milvus baseline metric, but cosine distance or negative
+    /// dot product if the index was built with that metric instead.
     pub fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<(RecordId, f32)> {
         if self.tombstoned.is_empty() {
             return self
@@ -263,108 +293,124 @@ impl VectorIndex {
     /// filters, answered by exact brute-force distance computation over
     /// the small matching candidate set, which is cheaper than a graph
     /// search when there are only a handful of candidates anyway.
+    ///
+    /// Phase 10 extended `op` beyond bare equality to range comparisons
+    /// (`Gt`/`Gte`/`Lt`/`Lte`, meaningful only against `MetadataValue::Number`
+    /// fields). **A deliberate, documented scope boundary**: only `Eq`
+    /// can use the selective-candidate fast path (`field_index` is an
+    /// exact-match lookup structure; there's no equivalent sorted
+    /// numeric index yet for efficient range candidate generation).
+    /// Range queries always go through the graph-traversal path --
+    /// correct, just without that extra optimization for now. A real,
+    /// reasonable place to stop for this pass, not an oversight -- see
+    /// HISTORY.md's Phase 10 section.
     pub fn search_filtered(
         &self,
         query: &[f32],
         k: usize,
         ef_search: usize,
         field: &str,
-        value: &str,
+        op: &FilterOp,
     ) -> Vec<(RecordId, f32)> {
-        let candidate_internal_ids: Vec<usize> = self
-            .field_index
-            .get(field)
-            .and_then(|values| values.get(value))
-            .map(|ids| ids.iter().copied().filter(|&id| self.is_live_internal(id)).collect())
-            .unwrap_or_default();
+        if let FilterOp::Eq(target) = op {
+            let key = target.canonical_key();
+            let candidate_internal_ids: Vec<usize> = self
+                .field_index
+                .get(field)
+                .and_then(|values| values.get(&key))
+                .map(|ids| ids.iter().copied().filter(|&id| self.is_live_internal(id)).collect())
+                .unwrap_or_default();
 
-        if candidate_internal_ids.is_empty() {
-            return Vec::new();
-        }
-
-        if candidate_internal_ids.len() <= BRUTE_FORCE_THRESHOLD {
-            // Real-hardware benchmarking (bench/README.md's Phase 4
-            // section) found the sort was never the bottleneck here --
-            // the previous heap optimization (below) confirmed that by
-            // barely moving the number. The actual cost is the distance
-            // arithmetic itself: at 2,500 candidates x 128 dimensions,
-            // that's ~320,000 floating-point operations per query. Each
-            // candidate's distance is independent of every other, which
-            // makes this "embarrassingly parallel" -- computing them
-            // across CPU cores (via rayon) is a much lower-risk lever
-            // than manual SIMD (no unsafe code, no platform-specific
-            // intrinsics) for the exact bottleneck that was measured,
-            // not guessed at.
-            //
-            // Below PARALLEL_THRESHOLD candidates, skip the parallel
-            // path -- thread-pool dispatch overhead can exceed the
-            // actual work for small candidate sets, and the sequential
-            // path already measured well there (0.22x-0.52x tax).
-            const PARALLEL_THRESHOLD: usize = 200;
-
-            let scored: Vec<Candidate> = if candidate_internal_ids.len() > PARALLEL_THRESHOLD {
-                use rayon::prelude::*;
-                // Reverted from chunked back to per-item par_iter after
-                // real measurement: chunking reduced task-dispatch
-                // overhead in theory, but on real (noisy, shared laptop)
-                // hardware it measured WORSE on the typical case (median
-                // 1.76x -> 2.32x) despite lower variance -- likely
-                // because per-item granularity lets rayon's work-stealing
-                // scheduler adapt when a thread gets preempted by
-                // background system load, while a whole chunk stalling
-                // costs more than the scheduling overhead chunking saved.
-                // Documented here rather than silently reverted, since
-                // "the safer-looking optimization measured worse" is
-                // itself a useful, real finding -- see bench/README.md's
-                // Phase 4 section for the actual numbers this is based on.
-                candidate_internal_ids
-                    .par_iter()
-                    .map(|&id| {
-                        let v = self.hnsw.vector(id);
-                        let dist: f32 = query.iter().zip(v.iter()).map(|(a, b)| (a - b) * (a - b)).sum();
-                        Candidate { dist, id }
-                    })
-                    .collect()
-            } else {
-                candidate_internal_ids
-                    .iter()
-                    .map(|&id| {
-                        let v = self.hnsw.vector(id);
-                        let dist: f32 = query.iter().zip(v.iter()).map(|(a, b)| (a - b) * (a - b)).sum();
-                        Candidate { dist, id }
-                    })
-                    .collect()
-            };
-
-            // Bounded top-k selection via a max-heap of size k, instead
-            // of a full sort -- O(n log k) instead of O(n log n). This
-            // part stays sequential: k is tiny (10-ish), so there's
-            // nothing meaningful to parallelize here, and the earlier
-            // measurement showed this step was never the bottleneck
-            // anyway. The distance computation above was.
-            let mut heap: BinaryHeap<Candidate> = BinaryHeap::with_capacity(k + 1);
-            for c in scored {
-                if heap.len() < k {
-                    heap.push(c);
-                } else if heap.peek().map(|worst| c.dist < worst.dist).unwrap_or(true) {
-                    heap.pop();
-                    heap.push(c);
-                }
+            if candidate_internal_ids.is_empty() {
+                return Vec::new();
             }
-            let mut out: Vec<Candidate> = heap.into_vec();
-            out.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(std::cmp::Ordering::Equal));
-            return out.into_iter().map(|c| (self.id_map[c.id], c.dist)).collect();
+
+            if candidate_internal_ids.len() <= BRUTE_FORCE_THRESHOLD {
+                // Real-hardware benchmarking (bench/README.md's Phase 4
+                // section) found the sort was never the bottleneck here --
+                // the previous heap optimization (below) confirmed that by
+                // barely moving the number. The actual cost is the distance
+                // arithmetic itself: at 2,500 candidates x 128 dimensions,
+                // that's ~320,000 floating-point operations per query. Each
+                // candidate's distance is independent of every other, which
+                // makes this "embarrassingly parallel" -- computing them
+                // across CPU cores (via rayon) is a much lower-risk lever
+                // than manual SIMD (no unsafe code, no platform-specific
+                // intrinsics) for the exact bottleneck that was measured,
+                // not guessed at.
+                //
+                // Below PARALLEL_THRESHOLD candidates, skip the parallel
+                // path -- thread-pool dispatch overhead can exceed the
+                // actual work for small candidate sets, and the sequential
+                // path already measured well there (0.22x-0.52x tax).
+                const PARALLEL_THRESHOLD: usize = 200;
+
+                let scored: Vec<Candidate> = if candidate_internal_ids.len() > PARALLEL_THRESHOLD {
+                    use rayon::prelude::*;
+                    // Reverted from chunked back to per-item par_iter after
+                    // real measurement: chunking reduced task-dispatch
+                    // overhead in theory, but on real (noisy, shared laptop)
+                    // hardware it measured WORSE on the typical case (median
+                    // 1.76x -> 2.32x) despite lower variance -- likely
+                    // because per-item granularity lets rayon's work-stealing
+                    // scheduler adapt when a thread gets preempted by
+                    // background system load, while a whole chunk stalling
+                    // costs more than the scheduling overhead chunking saved.
+                    // Documented here rather than silently reverted, since
+                    // "the safer-looking optimization measured worse" is
+                    // itself a useful, real finding -- see bench/README.md's
+                    // Phase 4 section for the actual numbers this is based on.
+                    candidate_internal_ids
+                        .par_iter()
+                        .map(|&id| {
+                            let dist = self.hnsw.distance_to(query, id);
+                            Candidate { dist, id }
+                        })
+                        .collect()
+                } else {
+                    candidate_internal_ids
+                        .iter()
+                        .map(|&id| {
+                            let dist = self.hnsw.distance_to(query, id);
+                            Candidate { dist, id }
+                        })
+                        .collect()
+                };
+
+                // Bounded top-k selection via a max-heap of size k, instead
+                // of a full sort -- O(n log k) instead of O(n log n). This
+                // part stays sequential: k is tiny (10-ish), so there's
+                // nothing meaningful to parallelize here, and the earlier
+                // measurement showed this step was never the bottleneck
+                // anyway. The distance computation above was.
+                let mut heap: BinaryHeap<Candidate> = BinaryHeap::with_capacity(k + 1);
+                for c in scored {
+                    if heap.len() < k {
+                        heap.push(c);
+                    } else if heap.peek().map(|worst| c.dist < worst.dist).unwrap_or(true) {
+                        heap.pop();
+                        heap.push(c);
+                    }
+                }
+                let mut out: Vec<Candidate> = heap.into_vec();
+                out.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(std::cmp::Ordering::Equal));
+                return out.into_iter().map(|c| (self.id_map[c.id], c.dist)).collect();
+            }
+            // Else: candidate set too broad for the brute-force shortcut --
+            // fall through to the graph-traversal path below, same as a
+            // range query always does.
         }
 
-        // Broad filter: push the predicate into the graph traversal
+        // Broad filter (or a range op, which has no fast-path candidate
+        // structure at all): push the predicate into the graph traversal
         // instead of overfetching-then-filtering.
         let field_owned = field.to_string();
-        let value_owned = value.to_string();
+        let op_owned = op.clone();
         let metadata = &self.metadata;
         let tombstoned = &self.tombstoned;
         let filter = move |internal_id: usize| {
             !tombstoned.contains(&internal_id)
-                && metadata[internal_id].get(&field_owned).map(|v| v == &value_owned).unwrap_or(false)
+                && metadata[internal_id].get(&field_owned).map(|v| op_owned.matches(v)).unwrap_or(false)
         };
 
         self.hnsw
@@ -503,10 +549,10 @@ mod tests {
         let mut index = VectorIndex::empty(HnswParams::default(), 1);
         for i in 0..20u64 {
             let category = if i % 2 == 0 { "docs" } else { "code" };
-            index.insert(i, &[i as f32, 0.0], &HashMap::from([("category".to_string(), category.to_string())]));
+            index.insert(i, &[i as f32, 0.0], &HashMap::from([("category".to_string(), MetadataValue::String(category.to_string()))]));
         }
 
-        let results = index.search_filtered(&[0.0, 0.0], 5, 50, "category", "docs");
+        let results = index.search_filtered(&[0.0, 0.0], 5, 50, "category", &FilterOp::Eq(MetadataValue::String("docs".to_string())));
         assert!(!results.is_empty());
         for (id, _) in &results {
             assert_eq!(id % 2, 0, "only 'docs' (even ids) should be returned, got id {id}");
@@ -517,11 +563,11 @@ mod tests {
     fn search_filtered_excludes_deleted_records() {
         let mut index = VectorIndex::empty(HnswParams::default(), 1);
         for i in 0..10u64 {
-            index.insert(i, &[i as f32, 0.0], &HashMap::from([("category".to_string(), "docs".to_string())]));
+            index.insert(i, &[i as f32, 0.0], &HashMap::from([("category".to_string(), MetadataValue::String("docs".to_string()))]));
         }
         index.delete(3);
 
-        let results = index.search_filtered(&[0.0, 0.0], 10, 50, "category", "docs");
+        let results = index.search_filtered(&[0.0, 0.0], 10, 50, "category", &FilterOp::Eq(MetadataValue::String("docs".to_string())));
         let ids: Vec<RecordId> = results.iter().map(|(id, _)| *id).collect();
         assert!(!ids.contains(&3), "deleted record should not appear in filtered results");
     }
@@ -529,9 +575,113 @@ mod tests {
     #[test]
     fn search_filtered_returns_empty_for_unknown_value() {
         let mut index = VectorIndex::empty(HnswParams::default(), 1);
-        index.insert(1, &[0.0, 0.0], &HashMap::from([("category".to_string(), "docs".to_string())]));
-        let results = index.search_filtered(&[0.0, 0.0], 5, 50, "category", "nonexistent");
+        index.insert(1, &[0.0, 0.0], &HashMap::from([("category".to_string(), MetadataValue::String("docs".to_string()))]));
+        let results = index.search_filtered(&[0.0, 0.0], 5, 50, "category", &FilterOp::Eq(MetadataValue::String("nonexistent".to_string())));
         assert!(results.is_empty());
+    }
+
+    // -- Phase 10: typed metadata tests --------------------------------
+
+    #[test]
+    fn numeric_equality_filter_matches_exact_number() {
+        let mut index = VectorIndex::empty(HnswParams::default(), 1);
+        index.insert(1, &[0.0, 0.0], &HashMap::from([("price".to_string(), MetadataValue::Number(29.99))]));
+        index.insert(2, &[1.0, 1.0], &HashMap::from([("price".to_string(), MetadataValue::Number(50.0))]));
+        let results = index.search_filtered(&[0.0, 0.0], 5, 50, "price", &FilterOp::Eq(MetadataValue::Number(29.99)));
+        let ids: Vec<RecordId> = results.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![1]);
+    }
+
+    #[test]
+    fn string_and_number_with_same_canonical_text_do_not_collide() {
+        // A real correctness risk this project's own discipline requires
+        // testing directly, not just hoping the canonical_key design
+        // works: the string "42" and the number 42 must never be treated
+        // as equal, even though naively stringifying both would produce
+        // the same text. canonical_key()'s type-tagged prefix exists
+        // specifically to prevent this.
+        let mut index = VectorIndex::empty(HnswParams::default(), 1);
+        index.insert(1, &[0.0, 0.0], &HashMap::from([("code".to_string(), MetadataValue::String("42".to_string()))]));
+        index.insert(2, &[1.0, 1.0], &HashMap::from([("code".to_string(), MetadataValue::Number(42.0))]));
+
+        let string_match = index.search_filtered(&[0.0, 0.0], 5, 50, "code", &FilterOp::Eq(MetadataValue::String("42".to_string())));
+        let number_match = index.search_filtered(&[0.0, 0.0], 5, 50, "code", &FilterOp::Eq(MetadataValue::Number(42.0)));
+
+        assert_eq!(string_match.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![1], "string \"42\" filter should only match the string record");
+        assert_eq!(number_match.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![2], "number 42 filter should only match the number record");
+    }
+
+    #[test]
+    fn range_filter_gt_excludes_boundary_and_below() {
+        let mut index = VectorIndex::empty(HnswParams::default(), 1);
+        for (id, price) in [(1, 10.0), (2, 20.0), (3, 30.0)] {
+            index.insert(id, &[id as f32, 0.0], &HashMap::from([("price".to_string(), MetadataValue::Number(price))]));
+        }
+        let results = index.search_filtered(&[0.0, 0.0], 10, 50, "price", &FilterOp::Gt(20.0));
+        let mut ids: Vec<RecordId> = results.iter().map(|(id, _)| *id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![3], "gt(20.0) should exclude both the boundary (20.0) and anything below it");
+    }
+
+    #[test]
+    fn range_filter_gte_includes_boundary() {
+        let mut index = VectorIndex::empty(HnswParams::default(), 1);
+        for (id, price) in [(1, 10.0), (2, 20.0), (3, 30.0)] {
+            index.insert(id, &[id as f32, 0.0], &HashMap::from([("price".to_string(), MetadataValue::Number(price))]));
+        }
+        let results = index.search_filtered(&[0.0, 0.0], 10, 50, "price", &FilterOp::Gte(20.0));
+        let mut ids: Vec<RecordId> = results.iter().map(|(id, _)| *id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![2, 3], "gte(20.0) should include the boundary");
+    }
+
+    #[test]
+    fn range_filter_lt_and_lte_are_correctly_exclusive_and_inclusive() {
+        let mut index = VectorIndex::empty(HnswParams::default(), 1);
+        for (id, price) in [(1, 10.0), (2, 20.0), (3, 30.0)] {
+            index.insert(id, &[id as f32, 0.0], &HashMap::from([("price".to_string(), MetadataValue::Number(price))]));
+        }
+        let mut lt_ids: Vec<RecordId> = index.search_filtered(&[0.0, 0.0], 10, 50, "price", &FilterOp::Lt(20.0)).iter().map(|(id, _)| *id).collect();
+        lt_ids.sort();
+        assert_eq!(lt_ids, vec![1]);
+
+        let mut lte_ids: Vec<RecordId> = index.search_filtered(&[0.0, 0.0], 10, 50, "price", &FilterOp::Lte(20.0)).iter().map(|(id, _)| *id).collect();
+        lte_ids.sort();
+        assert_eq!(lte_ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn range_filter_against_non_numeric_field_matches_nothing_not_panics() {
+        let mut index = VectorIndex::empty(HnswParams::default(), 1);
+        index.insert(1, &[0.0, 0.0], &HashMap::from([("category".to_string(), MetadataValue::String("docs".to_string()))]));
+        let results = index.search_filtered(&[0.0, 0.0], 5, 50, "category", &FilterOp::Gt(10.0));
+        assert!(results.is_empty(), "a range filter against a string field should match nothing, not panic or error");
+    }
+
+    #[test]
+    fn boolean_equality_filter_works() {
+        let mut index = VectorIndex::empty(HnswParams::default(), 1);
+        index.insert(1, &[0.0, 0.0], &HashMap::from([("in_stock".to_string(), MetadataValue::Bool(true))]));
+        index.insert(2, &[1.0, 1.0], &HashMap::from([("in_stock".to_string(), MetadataValue::Bool(false))]));
+        let results = index.search_filtered(&[0.0, 0.0], 5, 50, "in_stock", &FilterOp::Eq(MetadataValue::Bool(true)));
+        assert_eq!(results.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[test]
+    fn range_filter_works_through_broad_graph_traversal_path_too() {
+        // Range queries always use the graph-traversal path (no fast
+        // selective-candidate shortcut -- see search_filtered's doc
+        // comment), so this specifically exercises that path with enough
+        // data to be a meaningful, non-trivial traversal.
+        let mut index = VectorIndex::empty(HnswParams::default(), 1);
+        let mut rng_seed = 1u64;
+        for id in 0..200u64 {
+            rng_seed = rng_seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let price = (rng_seed % 100) as f64;
+            index.insert(id, &[(id % 20) as f32, (id / 20) as f32], &HashMap::from([("price".to_string(), MetadataValue::Number(price))]));
+        }
+        let results = index.search_filtered(&[5.0, 5.0], 10, 100, "price", &FilterOp::Gte(90.0));
+        assert!(!results.is_empty(), "should find at least some matches with a 10%-selectivity range filter over 200 records");
     }
 
     #[test]
@@ -555,14 +705,14 @@ mod tests {
         for i in 0..10_000u64 {
             let v: Vec<f32> = (0..16).map(|_| rng_data.gen_range(-10.0..10.0)).collect();
             let category = if i % 3 == 0 { "docs" } else { "other" };
-            index.insert(i, &v, &HashMap::from([("category".to_string(), category.to_string())]));
+            index.insert(i, &v, &HashMap::from([("category".to_string(), MetadataValue::String(category.to_string()))]));
             all_vectors.push((i, v, category));
         }
 
         let query: Vec<f32> = (0..16).map(|_| rng_data.gen_range(-10.0..10.0)).collect();
         let k = 10;
 
-        let approx = index.search_filtered(&query, k, 100, "category", "docs");
+        let approx = index.search_filtered(&query, k, 100, "category", &FilterOp::Eq(MetadataValue::String("docs".to_string())));
         let approx_ids: HashSet<RecordId> = approx.iter().map(|(id, _)| *id).collect();
 
         let mut brute: Vec<(RecordId, f32)> = all_vectors
@@ -605,14 +755,14 @@ mod tests {
         for i in 0..3000u64 {
             let v: Vec<f32> = (0..16).map(|_| rng_data.gen_range(-10.0..10.0)).collect();
             let category = if i % 3 == 0 { "docs" } else { "other" };
-            index.insert(i, &v, &HashMap::from([("category".to_string(), category.to_string())]));
+            index.insert(i, &v, &HashMap::from([("category".to_string(), MetadataValue::String(category.to_string()))]));
             all_vectors.push((i, v, category));
         }
 
         let query: Vec<f32> = (0..16).map(|_| rng_data.gen_range(-10.0..10.0)).collect();
         let k = 10;
 
-        let approx = index.search_filtered(&query, k, 100, "category", "docs");
+        let approx = index.search_filtered(&query, k, 100, "category", &FilterOp::Eq(MetadataValue::String("docs".to_string())));
 
         let mut brute: Vec<(RecordId, f32)> = all_vectors
             .iter()

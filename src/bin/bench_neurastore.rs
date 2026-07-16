@@ -25,7 +25,9 @@
 //!
 //!   cargo run --release --bin bench_neurastore -- bench/data/siftsmall 10 40
 
-use neurastore::hnsw::HnswParams;
+use neurastore::hnsw::{DistanceMetric, HnswParams};
+use neurastore::record::MetadataValue;
+use neurastore::vector_index::FilterOp;
 use neurastore::Engine;
 use std::collections::HashMap;
 use std::env;
@@ -114,14 +116,27 @@ fn main() {
     let cardinality: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(4);
 
     let dir = Path::new(&data_dir);
-    let base_path = dir.join("siftsmall_base.fvecs");
-    let query_path = dir.join("siftsmall_query.fvecs");
-    let gt_path = dir.join("siftsmall_groundtruth.ivecs");
+    // The file prefix matches the directory's own basename -- this is
+    // how prepare_dataset.py lays things out for every SIFT-family
+    // dataset (bench/data/siftsmall/siftsmall_base.fvecs,
+    // bench/data/sift/sift_base.fvecs for the 1M corpus). Previously
+    // hardcoded to "siftsmall" specifically, which meant this binary
+    // would silently fail to find sift1m's files (actual prefix "sift",
+    // not "sift1m" or "siftsmall") -- caught before handing off
+    // sift1m instructions to anyone, not after.
+    let prefix = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("siftsmall")
+        .to_string();
+    let base_path = dir.join(format!("{prefix}_base.fvecs"));
+    let query_path = dir.join(format!("{prefix}_query.fvecs"));
+    let gt_path = dir.join(format!("{prefix}_groundtruth.ivecs"));
 
     for p in [&base_path, &query_path, &gt_path] {
         if !p.exists() {
             eprintln!("Missing dataset file: {p:?}");
-            eprintln!("Run `python bench/scripts/prepare_dataset.py --mode siftsmall` first.");
+            eprintln!("Run `python bench/scripts/prepare_dataset.py --mode siftsmall` (or --mode sift1m) first.");
             std::process::exit(1);
         }
     }
@@ -152,12 +167,12 @@ fn main() {
 
     println!("Inserting initial {}% (batched -- one WAL fsync, see Wal::append_batch docs)...", ((split as f64 / base.len() as f64) * 100.0).round());
     let insert_start = Instant::now();
-    let entries: Vec<(u64, Vec<f32>, HashMap<String, String>)> = initial
+    let entries: Vec<(u64, Vec<f32>, HashMap<String, MetadataValue>)> = initial
         .iter()
         .enumerate()
         .map(|(i, vector)| {
             let category = &categories[i % categories.len()];
-            (i as u64, vector.clone(), HashMap::from([("category".to_string(), category.to_string())]))
+            (i as u64, vector.clone(), HashMap::from([("category".to_string(), MetadataValue::String(category.to_string()))]))
         })
         .collect();
     engine.put_batch(entries).expect("batch insert failed");
@@ -167,7 +182,7 @@ fn main() {
 
     println!("Building HNSW index from the initial {}%...", ((split as f64 / base.len() as f64) * 100.0).round());
     let build_start = Instant::now();
-    engine.build_index_with_params(HnswParams { m: 16, m_max0: 32, ef_construction: 64 }, 42);
+    engine.build_index_with_params(HnswParams { m: 16, m_max0: 32, ef_construction: 64, metric: DistanceMetric::L2 }, 42);
     let build_elapsed = build_start.elapsed().as_secs_f64();
     println!("NeuraStore HNSW build time: {build_elapsed:.2}s");
 
@@ -207,7 +222,7 @@ fn main() {
         let category = &categories[id as usize % categories.len()];
         let t0 = Instant::now();
         engine
-            .put(id, vector.clone(), HashMap::from([("category".to_string(), category.to_string())]))
+            .put(id, vector.clone(), HashMap::from([("category".to_string(), MetadataValue::String(category.to_string()))]))
             .expect("streaming insert failed");
         stream_latencies.push(t0.elapsed().as_secs_f64() * 1000.0);
     }
@@ -254,7 +269,7 @@ fn main() {
         for (i, q) in queries.iter().enumerate() {
             let category = &categories[i % categories.len()];
             let start = Instant::now();
-            engine.search_knn_filtered(q, k, ef_search, "category", &category);
+            engine.search_knn_filtered(q, k, ef_search, "category", &FilterOp::Eq(MetadataValue::String(category.clone())));
             latencies.push(start.elapsed().as_secs_f64() * 1000.0);
         }
         latencies
@@ -263,7 +278,7 @@ fn main() {
     // Warm up both paths before measuring either.
     for q in queries.iter().take(20.min(queries.len())) {
         engine.search_knn(q, k, ef_search);
-        engine.search_knn_filtered(q, k, ef_search, "category", &categories[0]);
+        engine.search_knn_filtered(q, k, ef_search, "category", &FilterOp::Eq(MetadataValue::String(categories[0].clone())));
     }
 
     let order_flip = std::process::id() % 2 == 0; // simple, dependency-free randomization

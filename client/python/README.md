@@ -127,6 +127,60 @@ Omitting `collection` entirely uses the same routes and behavior as
 before multi-collection support existed — nothing changes for existing
 code that doesn't pass it.
 
+## Metadata types and range queries
+
+Metadata values can be strings, numbers, or booleans:
+
+```python
+client.insert(1, [0.1, 0.2], metadata={"category": "docs", "price": 29.99, "in_stock": True})
+```
+
+Arrays and nested objects aren't supported — the server returns a clear
+error rather than silently dropping or coercing them.
+
+`search_filtered()` takes an optional `op` for numeric range queries
+(`"eq"` is the default and works against any type):
+
+```python
+client.search_filtered(vec, field="category", value="docs")          # equality, any type
+client.search_filtered(vec, field="price", value=100, op="gte")       # price >= 100
+```
+
+`op` can be `"eq"`, `"gt"`, `"gte"`, `"lt"`, or `"lte"`. Range ops only
+make sense against number fields — using one against a string or bool
+field matches nothing rather than raising an error.
+
+On the CLI, `--metadata` infers the type from plain text (`true`/`false`
+become booleans, anything numeric becomes a number, everything else
+stays a string):
+
+```bash
+neurastore insert --id 1 --vector 0.1,0.2 --metadata category=docs --metadata price=29.99 --metadata in_stock=true
+neurastore search-filtered --vector 0.1,0.2 --field price --op gte --value 100
+```
+
+## Distance metrics
+
+`build_index()` accepts an optional `metric`: `"l2"` (squared
+Euclidean, the default if omitted), `"cosine"`, or `"dot_product"`.
+
+```python
+client.build_index(metric="cosine")
+```
+
+Cosine matters in practice, not just as an option to have: most modern
+text embedding models are trained to be compared by direction, not raw
+Euclidean distance — using L2 against them is closer to a correctness
+gap than a stylistic preference.
+
+One real, non-obvious property worth knowing before choosing dot
+product specifically: unlike L2 or cosine, dot product does not
+guarantee a vector finds itself as its own nearest neighbor. It rewards
+magnitude as well as direction, so a different vector with larger
+magnitude and reasonable alignment can score higher than a vector's
+self-similarity — a known property of Maximum Inner Product Search, not
+a bug. Use L2 or cosine if "a vector always finds itself" needs to hold.
+
 ## Reclaiming space
 
 Deletes and updates leave old data behind on disk and in the vector
@@ -190,6 +244,12 @@ or `-` for stdin):
 ```bash
 neurastore insert-batch --file records.json
 neurastore insert-batch --file records.json --binary   # binary wire format
+```
+
+Build with a specific distance metric:
+
+```bash
+neurastore build-index --metric cosine
 ```
 
 Add `--json` before the subcommand for machine-readable output:

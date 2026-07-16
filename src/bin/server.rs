@@ -31,7 +31,9 @@ use axum::{
     routing::{delete, get, post},
     Router,
 };
-use neurastore::record::RecordId;
+use neurastore::hnsw::{DistanceMetric, HnswParams};
+use neurastore::record::{MetadataValue, RecordId};
+use neurastore::vector_index::FilterOp;
 use neurastore::Engine;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -60,8 +62,65 @@ type ApiKeys = Arc<Option<HashSet<String>>>;
 struct PutRequest {
     id: RecordId,
     vector: Vec<f32>,
+    /// Raw JSON here, not `MetadataValue` directly -- serde can't
+    /// deserialize straight into `MetadataValue` (it's a normal tagged
+    /// enum on purpose, for bincode compatibility -- see record.rs's
+    /// doc comment). Converted explicitly via `json_to_metadata_value`
+    /// in each handler, which is also where a client sending an array,
+    /// object, or null gets a clear 400 instead of a confusing type error.
     #[serde(default)]
-    metadata: HashMap<String, String>,
+    metadata: HashMap<String, serde_json::Value>,
+}
+
+/// Converts one JSON metadata value into the internal typed
+/// representation. Arrays, objects, and null are explicitly rejected
+/// with a clear message -- Phase 10 added string/number/bool, not
+/// arbitrary nested JSON, and a client sending an unsupported shape
+/// should get a real error, not silently-wrong behavior or a panic.
+fn json_to_metadata_value(v: &serde_json::Value) -> Result<MetadataValue, ApiError> {
+    match v {
+        serde_json::Value::String(s) => Ok(MetadataValue::String(s.clone())),
+        serde_json::Value::Number(n) => n
+            .as_f64()
+            .map(MetadataValue::Number)
+            .ok_or_else(|| ApiError::BadRequest("invalid number in metadata".to_string())),
+        serde_json::Value::Bool(b) => Ok(MetadataValue::Bool(*b)),
+        other => Err(ApiError::BadRequest(format!(
+            "metadata values must be strings, numbers, or booleans -- got {other} (arrays, objects, and null are not supported)"
+        ))),
+    }
+}
+
+fn metadata_value_to_json(v: &MetadataValue) -> serde_json::Value {
+    match v {
+        MetadataValue::String(s) => serde_json::Value::String(s.clone()),
+        MetadataValue::Number(n) => serde_json::json!(n),
+        MetadataValue::Bool(b) => serde_json::Value::Bool(*b),
+    }
+}
+
+fn convert_metadata_map(m: HashMap<String, serde_json::Value>) -> Result<HashMap<String, MetadataValue>, ApiError> {
+    m.into_iter().map(|(k, v)| json_to_metadata_value(&v).map(|mv| (k, mv))).collect()
+}
+
+#[derive(Deserialize, Default)]
+struct BuildIndexRequest {
+    /// "l2" (default), "cosine", or "dot_product" -- omit entirely for
+    /// the existing default (L2), full backward compatibility with
+    /// every caller that's never sent a body to this endpoint at all.
+    #[serde(default)]
+    metric: Option<String>,
+}
+
+fn parse_metric(s: Option<&str>) -> Result<DistanceMetric, ApiError> {
+    match s {
+        None | Some("l2") => Ok(DistanceMetric::L2),
+        Some("cosine") => Ok(DistanceMetric::Cosine),
+        Some("dot_product") | Some("dot") => Ok(DistanceMetric::DotProduct),
+        Some(other) => Err(ApiError::BadRequest(format!(
+            "unknown metric '{other}' -- expected 'l2', 'cosine', or 'dot_product'"
+        ))),
+    }
 }
 
 #[derive(Deserialize)]
@@ -73,7 +132,7 @@ struct PutBatchRequest {
 struct RecordResponse {
     id: RecordId,
     vector: Vec<f32>,
-    metadata: HashMap<String, String>,
+    metadata: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -93,7 +152,41 @@ struct FilteredSearchRequest {
     #[serde(default = "default_ef_search")]
     ef_search: usize,
     field: String,
-    value: String,
+    /// "eq" (default -- full backward compatibility with every caller
+    /// from before Phase 10, which only ever did string equality), or
+    /// "gt"/"gte"/"lt"/"lte" for numeric range queries.
+    #[serde(default)]
+    op: Option<String>,
+    /// Raw JSON, same reasoning as `PutRequest::metadata` -- a string
+    /// for "eq" against a string field (the pre-Phase-10 shape, still
+    /// works unchanged), or a number for anything else.
+    value: serde_json::Value,
+}
+
+/// Converts a filtered-search request's `op` + `value` into a
+/// `FilterOp`. Range ops require a numeric `value` -- sending
+/// `{"op": "gt", "value": "expensive"}` gets a clear 400, not a type
+/// coercion attempt or a silently-empty result set.
+fn parse_filter_op(op: Option<&str>, value: &serde_json::Value) -> Result<FilterOp, ApiError> {
+    let op = op.unwrap_or("eq");
+    match op {
+        "eq" => Ok(FilterOp::Eq(json_to_metadata_value(value)?)),
+        "gt" | "gte" | "lt" | "lte" => {
+            let n = value
+                .as_f64()
+                .ok_or_else(|| ApiError::BadRequest(format!("op '{op}' requires a numeric value, got {value}")))?;
+            Ok(match op {
+                "gt" => FilterOp::Gt(n),
+                "gte" => FilterOp::Gte(n),
+                "lt" => FilterOp::Lt(n),
+                "lte" => FilterOp::Lte(n),
+                _ => unreachable!(),
+            })
+        }
+        other => Err(ApiError::BadRequest(format!(
+            "unknown op '{other}' -- expected 'eq', 'gt', 'gte', 'lt', or 'lte'"
+        ))),
+    }
 }
 
 fn default_k() -> usize {
@@ -522,9 +615,10 @@ async fn put_record_impl(engine: SharedEngine, req: PutRequest) -> Result<Status
     if req.vector.is_empty() {
         return Err(ApiError::BadRequest("vector must not be empty".to_string()));
     }
+    let metadata = convert_metadata_map(req.metadata)?;
     let mut engine = engine.write().await;
     engine
-        .put(req.id, req.vector, req.metadata)
+        .put(req.id, req.vector, metadata)
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(StatusCode::CREATED)
 }
@@ -554,8 +648,11 @@ async fn put_batch_impl(engine: SharedEngine, req: PutBatchRequest) -> Result<St
             return Err(ApiError::BadRequest(format!("record {} has an empty vector", r.id)));
         }
     }
-    let entries: Vec<(RecordId, Vec<f32>, HashMap<String, String>)> =
-        req.records.into_iter().map(|r| (r.id, r.vector, r.metadata)).collect();
+    let entries: Vec<(RecordId, Vec<f32>, HashMap<String, MetadataValue>)> = req
+        .records
+        .into_iter()
+        .map(|r| convert_metadata_map(r.metadata).map(|m| (r.id, r.vector, m)))
+        .collect::<Result<_, ApiError>>()?;
     let mut engine = engine.write().await;
     engine.put_batch(entries).map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(StatusCode::CREATED)
@@ -605,7 +702,7 @@ enum BinaryParseError {
 /// Metadata stays as small JSON strings deliberately -- it's a handful
 /// of short key-value pairs, negligible in size next to the vector
 /// data, and not worth a fully custom binary format for.
-fn parse_binary_batch(bytes: &[u8]) -> Result<Vec<(RecordId, Vec<f32>, HashMap<String, String>)>, BinaryParseError> {
+fn parse_binary_batch(bytes: &[u8]) -> Result<Vec<(RecordId, Vec<f32>, HashMap<String, serde_json::Value>)>, BinaryParseError> {
     if bytes.len() < 12 {
         return Err(BinaryParseError::TooShort);
     }
@@ -644,7 +741,7 @@ fn parse_binary_batch(bytes: &[u8]) -> Result<Vec<(RecordId, Vec<f32>, HashMap<S
         if cursor + meta_len > bytes.len() {
             return Err(BinaryParseError::Truncated(i));
         }
-        let metadata: HashMap<String, String> = if meta_len == 0 {
+        let metadata: HashMap<String, serde_json::Value> = if meta_len == 0 {
             HashMap::new()
         } else {
             serde_json::from_slice(&bytes[cursor..cursor + meta_len])
@@ -672,6 +769,10 @@ async fn put_batch_binary_impl(engine: SharedEngine, body: Bytes) -> Result<Stat
             return Err(ApiError::BadRequest(format!("record {id} has an empty vector")));
         }
     }
+    let entries: Vec<(RecordId, Vec<f32>, HashMap<String, MetadataValue>)> = entries
+        .into_iter()
+        .map(|(id, vector, metadata)| convert_metadata_map(metadata).map(|m| (id, vector, m)))
+        .collect::<Result<_, ApiError>>()?;
     let mut engine = engine.write().await;
     engine.put_batch(entries).map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(StatusCode::CREATED)
@@ -699,7 +800,7 @@ async fn get_record_impl(engine: SharedEngine, id: RecordId) -> Result<Json<Reco
         Some(record) => Ok(Json(RecordResponse {
             id: record.id,
             vector: record.vector,
-            metadata: record.metadata,
+            metadata: record.metadata.iter().map(|(k, v)| (k.clone(), metadata_value_to_json(v))).collect(),
         })),
         None => Err(ApiError::NotFound),
     }
@@ -734,22 +835,36 @@ async fn delete_record_collection(
     delete_record_impl(engine, id).await
 }
 
-async fn build_index(State(engine): State<SharedEngine>) -> Result<StatusCode, ApiError> {
-    build_index_impl(engine).await
+async fn build_index(State(engine): State<SharedEngine>, body: Bytes) -> Result<StatusCode, ApiError> {
+    build_index_impl(engine, body).await
 }
 
-async fn build_index_impl(engine: SharedEngine) -> Result<StatusCode, ApiError> {
+async fn build_index_impl(engine: SharedEngine, body: Bytes) -> Result<StatusCode, ApiError> {
+    // Raw Bytes, not Json<BuildIndexRequest> -- axum's Json extractor
+    // requires a Content-Type header and a parseable body, which would
+    // reject every existing caller that sends this endpoint no body at
+    // all (every client and test written before metric support existed).
+    // Empty body -> defaults; non-empty body -> parsed as JSON.
+    let metric = if body.is_empty() {
+        DistanceMetric::L2
+    } else {
+        let req: BuildIndexRequest = serde_json::from_slice(&body)
+            .map_err(|e| ApiError::BadRequest(format!("invalid request body: {e}")))?;
+        parse_metric(req.metric.as_deref())?
+    };
+    let params = HnswParams { metric, ..HnswParams::default() };
     let mut engine = engine.write().await;
-    engine.build_index();
+    engine.build_index_with_params(params, 42); // seed matches Engine::build_index()'s own default
     Ok(StatusCode::OK)
 }
 
 async fn build_index_collection(
     State(collections): State<CollectionManager>,
     Path(collection): Path<String>,
+    body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     let engine = collections.get_or_create(&collection).await?;
-    build_index_impl(engine).await
+    build_index_impl(engine, body).await
 }
 
 async fn compact(State(engine): State<SharedEngine>) -> Result<StatusCode, ApiError> {
@@ -810,9 +925,10 @@ async fn search_filtered_impl(engine: SharedEngine, req: FilteredSearchRequest) 
     if req.vector.is_empty() {
         return Err(ApiError::BadRequest("vector must not be empty".to_string()));
     }
+    let op = parse_filter_op(req.op.as_deref(), &req.value)?;
     let engine = engine.read().await;
     let results = engine
-        .search_knn_filtered(&req.vector, req.k, req.ef_search, &req.field, &req.value)
+        .search_knn_filtered(&req.vector, req.k, req.ef_search, &req.field, &op)
         .ok_or_else(|| ApiError::BadRequest("index not built yet -- call POST /v1/index/build first".to_string()))?;
     Ok(Json(SearchResponse {
         results: results.into_iter().map(|(id, distance)| SearchResultItem { id, distance }).collect(),
@@ -1427,6 +1543,140 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    // -- Distance metric tests ----------------------------------------
+
+    #[tokio::test]
+    async fn build_index_with_no_body_defaults_to_l2_backward_compatible() {
+        // The critical backward-compat guarantee: every caller written
+        // before metric support existed sends this endpoint zero body
+        // at all. That must keep working exactly as before.
+        let app = build_test_router(no_security()).await;
+        let response = app
+            .oneshot(Request::builder().method("POST").uri("/v1/index/build").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "no body at all must still work and default to L2");
+    }
+
+    #[tokio::test]
+    async fn build_index_accepts_valid_metric_names() {
+        for metric in ["l2", "cosine", "dot_product"] {
+            let app = build_test_router(no_security()).await;
+            let body = serde_json::json!({"metric": metric});
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/index/build")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "metric '{metric}' should be accepted");
+        }
+    }
+
+    #[tokio::test]
+    async fn build_index_rejects_unknown_metric_name() {
+        let app = build_test_router(no_security()).await;
+        let body = serde_json::json!({"metric": "manhattan"});
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/index/build")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn cosine_metric_changes_search_results_end_to_end_over_real_http() {
+        // The real, end-to-end proof: build the SAME data twice, once
+        // with each metric, and confirm ranking actually differs via the
+        // real HTTP API -- not just at the Rust-internal level already
+        // covered by hnsw.rs's own tests.
+        let insert_data = |app: Router| async move {
+            for (id, vec) in [(1u64, [1.0, 0.0]), (2, [20.0, 0.0]), (3, [0.9, 0.1])] {
+                let body = serde_json::json!({"id": id, "vector": vec});
+                app.clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/v1/records")
+                            .header("content-type", "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            app
+        };
+
+        // L2-built index.
+        let app_l2 = insert_data(build_test_router(no_security()).await).await;
+        app_l2
+            .clone()
+            .oneshot(Request::builder().method("POST").uri("/v1/index/build").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let search_body = serde_json::json!({"vector": [1.0, 0.0], "k": 1, "ef_search": 50});
+        let l2_response = app_l2
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(search_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let l2_json = body_json(l2_response).await;
+        let l2_top1 = l2_json["results"][0]["id"].as_i64().unwrap();
+
+        // Cosine-built index, same data.
+        let app_cos = insert_data(build_test_router(no_security()).await).await;
+        let build_body = serde_json::json!({"metric": "cosine"});
+        app_cos
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/index/build")
+                    .header("content-type", "application/json")
+                    .body(Body::from(build_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cos_response = app_cos
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(search_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cos_json = body_json(cos_response).await;
+        let cos_top1 = cos_json["results"][0]["id"].as_i64().unwrap();
+
+        // L2 must not pick id 2 (magnitude 20, far in raw distance).
+        assert_ne!(l2_top1, 2, "L2 should not rank the large-magnitude vector as nearest");
+        // Cosine should pick id 1 or id 2 -- both exactly on-direction.
+        assert!(cos_top1 == 1 || cos_top1 == 2, "cosine should rank one of the on-direction vectors as nearest, got {cos_top1}");
+    }
+
     // -- Multi-collection tests --------------------------------------
 
     #[tokio::test]
@@ -1615,6 +1865,178 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // -- Phase 10: typed metadata HTTP tests ---------------------------
+
+    #[tokio::test]
+    async fn insert_and_get_numeric_and_boolean_metadata_over_http() {
+        let app = build_test_router(no_security()).await;
+        let put_body = serde_json::json!({
+            "id": 1,
+            "vector": [1.0, 2.0],
+            "metadata": {"category": "docs", "price": 29.99, "in_stock": true}
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/records")
+                    .header("content-type", "application/json")
+                    .body(Body::from(put_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let response = app.oneshot(Request::builder().uri("/v1/records/1").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["metadata"]["category"], "docs");
+        assert_eq!(json["metadata"]["price"], 29.99);
+        assert_eq!(json["metadata"]["in_stock"], true);
+    }
+
+    #[tokio::test]
+    async fn insert_rejects_array_metadata_value_with_clear_error() {
+        let app = build_test_router(no_security()).await;
+        let put_body = serde_json::json!({"id": 1, "vector": [1.0], "metadata": {"tags": ["a", "b"]}});
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/records")
+                    .header("content-type", "application/json")
+                    .body(Body::from(put_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(response).await;
+        assert!(json["error"].as_str().unwrap().contains("arrays"));
+    }
+
+    #[tokio::test]
+    async fn range_filter_over_http_end_to_end() {
+        let app = build_test_router(no_security()).await;
+        for (id, price) in [(1, 10.0), (2, 20.0), (3, 30.0)] {
+            let put_body = serde_json::json!({"id": id, "vector": [id as f32, 0.0], "metadata": {"price": price}});
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/records")
+                        .header("content-type", "application/json")
+                        .body(Body::from(put_body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        app.clone()
+            .oneshot(Request::builder().method("POST").uri("/v1/index/build").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let search_body = serde_json::json!({"vector": [0.0, 0.0], "k": 10, "ef_search": 50, "field": "price", "op": "gte", "value": 20.0});
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/search/filtered")
+                    .header("content-type", "application/json")
+                    .body(Body::from(search_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        let mut ids: Vec<i64> = json["results"].as_array().unwrap().iter().map(|r| r["id"].as_i64().unwrap()).collect();
+        ids.sort();
+        assert_eq!(ids, vec![2, 3], "gte(20.0) should include the boundary and everything above");
+    }
+
+    #[tokio::test]
+    async fn filtered_search_without_op_still_defaults_to_equality_backward_compatible() {
+        // The exact pre-Phase-10 request shape: no "op" field at all.
+        let app = build_test_router(no_security()).await;
+        for (id, category) in [(1, "docs"), (2, "code")] {
+            let put_body = serde_json::json!({"id": id, "vector": [id as f32, 0.0], "metadata": {"category": category}});
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/records")
+                        .header("content-type", "application/json")
+                        .body(Body::from(put_body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        app.clone()
+            .oneshot(Request::builder().method("POST").uri("/v1/index/build").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let search_body = serde_json::json!({"vector": [0.0, 0.0], "k": 10, "ef_search": 50, "field": "category", "value": "docs"});
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/search/filtered")
+                    .header("content-type", "application/json")
+                    .body(Body::from(search_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        let ids: Vec<i64> = json["results"].as_array().unwrap().iter().map(|r| r["id"].as_i64().unwrap()).collect();
+        assert_eq!(ids, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn range_op_with_non_numeric_value_returns_clear_400() {
+        let app = build_test_router(no_security()).await;
+        let search_body = serde_json::json!({"vector": [0.0, 0.0], "k": 5, "field": "price", "op": "gt", "value": "expensive"});
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/search/filtered")
+                    .header("content-type", "application/json")
+                    .body(Body::from(search_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(response).await;
+        assert!(json["error"].as_str().unwrap().contains("numeric"));
+    }
+
+    #[tokio::test]
+    async fn unknown_filter_op_returns_clear_400() {
+        let app = build_test_router(no_security()).await;
+        let search_body = serde_json::json!({"vector": [0.0, 0.0], "k": 5, "field": "price", "op": "between", "value": 5.0});
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/search/filtered")
+                    .header("content-type", "application/json")
+                    .body(Body::from(search_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

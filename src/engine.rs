@@ -22,9 +22,9 @@
 
 use crate::hnsw::HnswParams;
 use crate::memtable::MemTable;
-use crate::record::{Record, RecordId};
+use crate::record::{MetadataValue, Record, RecordId};
 use crate::sstable::{self, SSTableError, SSTableReader};
-use crate::vector_index::VectorIndex;
+use crate::vector_index::{FilterOp, VectorIndex};
 use crate::wal::{Wal, WalError};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -146,7 +146,7 @@ impl Engine {
         &mut self,
         id: RecordId,
         vector: Vec<f32>,
-        metadata: HashMap<String, String>,
+        metadata: HashMap<String, MetadataValue>,
     ) -> Result<(), EngineError> {
         let record = Record::new(id, vector, metadata, self.next_seq());
         self.wal.append(&record)?;
@@ -173,7 +173,7 @@ impl Engine {
     /// guarantee the instant it returns, use `put` instead.
     pub fn put_batch(
         &mut self,
-        entries: Vec<(RecordId, Vec<f32>, HashMap<String, String>)>,
+        entries: Vec<(RecordId, Vec<f32>, HashMap<String, MetadataValue>)>,
     ) -> Result<(), EngineError> {
         let records: Vec<Record> = entries
             .into_iter()
@@ -318,12 +318,12 @@ impl Engine {
         k: usize,
         ef_search: usize,
         field: &str,
-        value: &str,
+        op: &FilterOp,
     ) -> Option<Vec<(RecordId, f32)>> {
         self.vector_index.as_ref().map(|idx| {
             idx.read()
                 .expect("vector index lock poisoned")
-                .search_filtered(query, k, ef_search, field, value)
+                .search_filtered(query, k, ef_search, field, op)
         })
     }
 
@@ -566,7 +566,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let mut engine = Engine::open(dir.path()).unwrap();
-            let entries: Vec<(RecordId, Vec<f32>, HashMap<String, String>)> = (1..=200)
+            let entries: Vec<(RecordId, Vec<f32>, HashMap<String, MetadataValue>)> = (1..=200)
                 .map(|i| (i, vec![i as f32], HashMap::new()))
                 .collect();
             engine.put_batch(entries).unwrap();
@@ -595,7 +595,7 @@ mod tests {
         let batch_start = std::time::Instant::now();
         {
             let mut engine = Engine::open(dir.path().join("batch")).unwrap();
-            let entries: Vec<(RecordId, Vec<f32>, HashMap<String, String>)> =
+            let entries: Vec<(RecordId, Vec<f32>, HashMap<String, MetadataValue>)> =
                 (1..=300).map(|i| (i, vec![i as f32], HashMap::new())).collect();
             engine.put_batch(entries).unwrap();
         }
@@ -654,7 +654,7 @@ mod tests {
         engine.put(1, vec![0.0, 0.0], HashMap::new()).unwrap();
         engine.build_index();
 
-        let entries: Vec<(RecordId, Vec<f32>, HashMap<String, String>)> =
+        let entries: Vec<(RecordId, Vec<f32>, HashMap<String, MetadataValue>)> =
             (2..=50).map(|i| (i, vec![i as f32, i as f32], HashMap::new())).collect();
         engine.put_batch(entries).unwrap();
 
@@ -677,7 +677,7 @@ mod tests {
         let mut engine = Engine::open(dir.path()).unwrap();
         // Seed with an initial batch so readers have something to search
         // from the moment threads start, not just an empty index.
-        let seed_entries: Vec<(RecordId, Vec<f32>, HashMap<String, String>)> =
+        let seed_entries: Vec<(RecordId, Vec<f32>, HashMap<String, MetadataValue>)> =
             (0..200).map(|i| (i, vec![i as f32, (i % 13) as f32], HashMap::new())).collect();
         engine.put_batch(seed_entries).unwrap();
         engine.build_index();
@@ -756,12 +756,12 @@ mod tests {
         for i in 0..20u64 {
             let category = if i % 2 == 0 { "docs" } else { "code" };
             engine
-                .put(i, vec![i as f32, 0.0], HashMap::from([("category".to_string(), category.to_string())]))
+                .put(i, vec![i as f32, 0.0], HashMap::from([("category".to_string(), MetadataValue::String(category.to_string()))]))
                 .unwrap();
         }
         engine.build_index();
 
-        let results = engine.search_knn_filtered(&[0.0, 0.0], 5, 50, "category", "docs").unwrap();
+        let results = engine.search_knn_filtered(&[0.0, 0.0], 5, 50, "category", &FilterOp::Eq(MetadataValue::String("docs".to_string()))).unwrap();
         assert!(!results.is_empty());
         for (id, _) in &results {
             assert_eq!(id % 2, 0, "only 'docs' (even ids) should be returned");
@@ -775,7 +775,7 @@ mod tests {
 
         for i in 0..10u64 {
             engine
-                .put(i, vec![i as f32, 0.0], HashMap::from([("category".to_string(), "docs".to_string())]))
+                .put(i, vec![i as f32, 0.0], HashMap::from([("category".to_string(), MetadataValue::String("docs".to_string()))]))
                 .unwrap();
         }
         engine.build_index();
@@ -784,13 +784,13 @@ mod tests {
         // without a rebuild, same as unfiltered search already proved in
         // Phase 3.
         engine
-            .put(10, vec![10.0, 0.0], HashMap::from([("category".to_string(), "docs".to_string())]))
+            .put(10, vec![10.0, 0.0], HashMap::from([("category".to_string(), MetadataValue::String("docs".to_string()))]))
             .unwrap();
         engine
-            .put(11, vec![11.0, 0.0], HashMap::from([("category".to_string(), "code".to_string())]))
+            .put(11, vec![11.0, 0.0], HashMap::from([("category".to_string(), MetadataValue::String("code".to_string()))]))
             .unwrap();
 
-        let results = engine.search_knn_filtered(&[10.0, 0.0], 5, 50, "category", "docs").unwrap();
+        let results = engine.search_knn_filtered(&[10.0, 0.0], 5, 50, "category", &FilterOp::Eq(MetadataValue::String("docs".to_string()))).unwrap();
         let ids: Vec<RecordId> = results.iter().map(|(id, _)| *id).collect();
         assert!(ids.contains(&10), "record added after build_index() should be findable via filtered search");
         assert!(!ids.contains(&11), "non-matching record should not appear");
@@ -804,19 +804,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut engine = Engine::open(dir.path()).unwrap();
         engine
-            .put(1, vec![0.0, 0.0], HashMap::from([("category".to_string(), "docs".to_string())]))
+            .put(1, vec![0.0, 0.0], HashMap::from([("category".to_string(), MetadataValue::String("docs".to_string()))]))
             .unwrap();
         engine.build_index();
 
         // Update: same id, different category.
         engine
-            .put(1, vec![0.0, 0.0], HashMap::from([("category".to_string(), "code".to_string())]))
+            .put(1, vec![0.0, 0.0], HashMap::from([("category".to_string(), MetadataValue::String("code".to_string()))]))
             .unwrap();
 
-        let docs_results = engine.search_knn_filtered(&[0.0, 0.0], 5, 50, "category", "docs").unwrap();
+        let docs_results = engine.search_knn_filtered(&[0.0, 0.0], 5, 50, "category", &FilterOp::Eq(MetadataValue::String("docs".to_string()))).unwrap();
         assert!(docs_results.is_empty(), "id 1 should no longer match 'docs' after being updated to 'code'");
 
-        let code_results = engine.search_knn_filtered(&[0.0, 0.0], 5, 50, "category", "code").unwrap();
+        let code_results = engine.search_knn_filtered(&[0.0, 0.0], 5, 50, "category", &FilterOp::Eq(MetadataValue::String("code".to_string()))).unwrap();
         assert!(code_results.iter().any(|(id, _)| *id == 1), "id 1 should match 'code' after the update");
     }
 
@@ -926,7 +926,7 @@ mod tests {
         }
         // Build with deliberately non-default params, to confirm compact()
         // doesn't silently revert to HnswParams::default() on rebuild.
-        let custom_params = HnswParams { m: 8, m_max0: 16, ef_construction: 32 };
+        let custom_params = HnswParams { m: 8, m_max0: 16, ef_construction: 32, metric: crate::hnsw::DistanceMetric::L2 };
         engine.build_index_with_params(custom_params, 7);
         assert_eq!(engine.index_len(), Some(5));
 
@@ -981,7 +981,7 @@ mod tests {
         for i in 0..100_000u64 {
             engine
                 .put(i, vec![i as f32, (i % 7) as f32], HashMap::from([
-                    ("category".to_string(), format!("cat{}", i % 4)),
+                    ("category".to_string(), MetadataValue::String(format!("cat{}", i % 4))),
                 ]))
                 .unwrap();
         }
