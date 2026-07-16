@@ -49,9 +49,10 @@ client.insert_batch([
 There's also a `binary=True` option using a compact binary wire format
 instead of JSON. It's real and correctness-tested, but its performance
 advantage over plain JSON was investigated and **not confirmed** on the
-hardware it was developed against — see the main repo's README for that
-whole story. Don't assume it's faster without measuring your own setup;
-default (`binary=False`) is the well-tested, unsurprising choice.
+hardware it was developed against — see the main repo's `HISTORY.md`
+for that whole story. Don't assume it's faster without measuring your
+own setup; default (`binary=False`) is the well-tested, unsurprising
+choice.
 
 ## Error handling
 
@@ -81,8 +82,8 @@ sequence of numbers (`list`, `tuple`, or a numpy array via `.tolist()`).
 ## Authentication
 
 If the server was started with `NEURASTORE_API_KEYS` set (see the main
-repo's README), every request needs a valid key. Pass it when
-constructing the client:
+repo's `HISTORY.md`, Phase 7 section), every request needs a valid key.
+Pass it when constructing the client:
 
 ```python
 client = NeuraStoreClient("http://localhost:8080", api_key="my-secret-key")
@@ -163,7 +164,7 @@ except RateLimitError:
 With API key auth also enabled, each key gets its own independent
 rate-limit bucket. Without auth, all clients share one server-wide
 bucket (there's no per-client identity to key on without a key) — see
-the main repo's README for that documented tradeoff.
+the main repo's `HISTORY.md` for that documented tradeoff.
 
 ## CLI
 

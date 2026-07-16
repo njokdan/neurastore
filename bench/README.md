@@ -109,21 +109,28 @@ in-process figures (that's the point -- this is the honest number) but
 still worth comparing directly against pgvector's SQL round-trip and
 Milvus's gRPC round-trip now that all three pay a real client-server cost.
 
-**Insert throughput specifically was investigated and improved across
-several rounds** (batch size, then `orjson`, then a dedicated binary
-endpoint) -- see the main `README.md`'s Phase 5 section for the full
-story. To benchmark the binary bulk-insert path instead of JSON:
+**Insert throughput was investigated at length** (batch size, then
+`orjson`, then a dedicated binary endpoint) -- see the main `HISTORY.md`'s
+Phase 5 section for the full story, including why this metric ended up
+**deliberately excluded** from the NeuraStore-vs-pgvector-vs-Milvus
+comparison. Short version: an early smoke test suggested the binary
+path was ~2.65x faster than JSON, but 6 controlled runs (3 each, fresh
+directories) showed the two encodings performing statistically
+indistinguishably -- the real driver of the huge run-to-run swings
+(900 to 17,000+ vec/sec) turned out to be environmental noise on the
+test machine, not the wire format. The binary endpoint still exists and
+is correctness-tested (`--binary` flag below), but don't treat it as a
+proven performance win without re-measuring on quieter hardware.
 
 ```bash
 python bench_neurastore_http.py --k 10 --ef-search 40 --binary
 ```
 
-Search/latency numbers should be about the same either way (only the
-insert path differs) -- the number that matters here is the insert
-throughput line. A smoke test at dim=128 (matching real siftsmall's
-dimensionality) showed the binary path ~2.65x faster than JSON with
-identical recall (confirming no data corruption) -- real-corpus
-confirmation still pending as of this writeup.
+If you want to help settle this properly: run each mode (with and
+without `--binary`) 3+ times, each against a genuinely fresh data
+directory (`/tmp/some_new_path` each time, not reused), and compare
+medians rather than trusting any single run -- see "reducing benchmark
+noise" notes in the main README if results still look wildly variable.
 
 ## 5. What to send back
 

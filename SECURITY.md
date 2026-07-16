@@ -29,7 +29,7 @@ beyond local development:
   at startup — check your logs.
 - **No TLS by default.** Traffic is plain HTTP unless you put a
   TLS-terminating reverse proxy in front (see `deploy/Caddyfile` and
-  `README.md`'s TLS section). Don't expose an un-proxied instance to
+  `HISTORY.md`'s TLS section). Don't expose an un-proxied instance to
   the public internet.
 - **No rate limiting by default.** Set `NEURASTORE_RATE_LIMIT_RPS` if
   you need protection against runaway or abusive clients.

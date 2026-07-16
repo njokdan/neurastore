@@ -61,7 +61,7 @@ new contributions are expected to match it, not water it down:
   unmodified afterward — not a claim, a re-run.
 - **If a benchmark or performance claim doesn't hold up under a second,
   more rigorous look, say so and fix the record.** The project's own
-  `README.md` documents a case where an early "insert throughput is
+  `HISTORY.md` documents a case where an early "insert throughput is
   behind pgvector" finding drove real engineering work, then turned out
   to be a test methodology bug once tested more rigorously — and that
   whole sequence is left visible rather than quietly corrected.
@@ -74,9 +74,12 @@ new contributions are expected to match it, not water it down:
 3. Python changes: `pytest` passes for both `test_client.py` and
    `test_cli.py`.
 4. If you touched a public API (an HTTP endpoint, a client method, a
-   CLI command), update the relevant `README.md` section and
-   `client/python/README.md` in the same PR — this project treats
-   undocumented behavior as unfinished behavior.
+   CLI command), update `HISTORY.md` with the detailed writeup (what
+   changed, why, how it was tested) in the same PR, update `README.md`'s
+   front-matter numbers table if the change affects the headline
+   benchmark results, and update `client/python/README.md` for
+   client-facing changes — this project treats undocumented behavior as
+   unfinished behavior.
 5. If you're fixing a bug, add the test that would have caught it
    *first*, confirm it fails against the old code, then fix it.
 

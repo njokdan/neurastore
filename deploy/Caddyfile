@@ -1,5 +1,5 @@
 # Reverse proxy config for Caddy, terminating TLS in front of the
-# NeuraStore server -- see README.md's "TLS" section for why this is
+# NeuraStore server -- see HISTORY.md's "TLS" section for why this is
 # the recommended pattern instead of building TLS into the Rust server
 # itself.
 #

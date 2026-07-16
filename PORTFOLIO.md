@@ -5,9 +5,10 @@ up through a hardened, multi-collection network service — written in
 Rust, benchmarked against pgvector and Milvus, and documented with
 every wrong turn left visible alongside every win.
 
-This document is the high-level story. For depth: [`README.md`](./README.md)
+This document is the high-level story. For depth: [`HISTORY.md`](./HISTORY.md)
 has the full phase-by-phase build log, [`COMPARISON.md`](./COMPARISON.md)
-has the fair head-to-head numbers, and [`bench/README.md`](./bench/README.md)
+has the fair head-to-head numbers, [`README.md`](./README.md) is the
+lean front door with a quickstart, and [`bench/README.md`](./bench/README.md)
 has exact reproduction steps for every benchmark cited here.
 
 ## What it is, in one paragraph
@@ -133,8 +134,8 @@ entirely.
 
 | Question | Where |
 |---|---|
-| How does each phase's architecture actually work? | [`README.md`](./README.md) |
+| How does each phase's architecture actually work? | [`HISTORY.md`](./HISTORY.md) |
 | What are the exact, reproducible benchmark numbers? | [`COMPARISON.md`](./COMPARISON.md), [`bench/README.md`](./bench/README.md) |
-| How do I run it? | `README.md`'s Phase 6 section (Docker, `cargo run`) |
+| How do I run it? | [`README.md`](./README.md)'s quickstart (Docker, `cargo run`) |
 | How do I use it from Python? | [`client/python/README.md`](./client/python/README.md) |
-| How do I deploy it with TLS? | `README.md`'s Phase 7 TLS section, [`deploy/Caddyfile`](./deploy/Caddyfile) |
+| How do I deploy it with TLS? | `HISTORY.md`'s Phase 7 TLS section, [`deploy/Caddyfile`](./deploy/Caddyfile) |
