@@ -327,6 +327,27 @@ impl Engine {
         })
     }
 
+    /// Same as `search_knn_filtered`, with the filtered-search graph
+    /// visit budget exposed explicitly -- see
+    /// `VectorIndex::search_filtered_with_max_visits`'s doc comment for
+    /// why this exists and why it's deliberately not (yet) wired
+    /// through the HTTP API.
+    pub fn search_knn_filtered_with_max_visits(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        field: &str,
+        op: &FilterOp,
+        max_visits: usize,
+    ) -> Option<Vec<(RecordId, f32)>> {
+        self.vector_index.as_ref().map(|idx| {
+            idx.read()
+                .expect("vector index lock poisoned")
+                .search_filtered_with_max_visits(query, k, ef_search, field, op, max_visits)
+        })
+    }
+
     fn maybe_flush(&mut self) -> Result<(), EngineError> {
         if self.memtable.len() >= self.flush_threshold {
             self.flush()?;

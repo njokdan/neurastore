@@ -151,13 +151,41 @@ substantial, single-variable effect, not noise.
 **Not fully resolved by that alone**: even at 5x the original
 `ef_search`, the filter tax (6.59x) is still roughly 5x worse than this
 project's actual headline number and still worse than pgvector's own
-tax at 10K scale. A second factor remains — most likely the
-filtered-search visit cap (`MAX_FILTERED_VISITS = 20,000`, untouched by
-this test and specific to the filtered path only), or a real
-scale-dependent graph-connectivity cost related to an already-documented
-Phase 2 property (`sparse_clusters_can_strand_a_whole_cluster_from_the_entry_point`)
-that would plausibly worsen, not improve, as the graph grows. The next
-real step is an isolated test of the visit cap on its own.
+tax at 10K scale.
+
+**`MAX_FILTERED_VISITS` (the filtered-search visit cap) has since been
+ruled out** — a genuinely useful negative result, tested in isolation
+(5x increase, `ef_search=200` held constant): recall stayed flat
+(expected — the cap only touches the filtered path) and the tax got
+measurably *worse*, not better (6.59x → 7.22x). Exploring more of the
+graph didn't find better matches; it just did more work.
+
+**A third hypothesis, tested cheaply before writing any production
+code**: is the *cost per visited node* the bottleneck, not the number
+of nodes visited? A standalone microbenchmark matching the real
+filtered-search closure's exact shape measured std `HashMap`'s SipHash
+at ~86.5ns/call versus `FxHashMap`'s ~41.1ns/call for the same
+multi-field lookup — a real, consistent ~2.1x difference. Fixed,
+confined entirely to `VectorIndex`'s private internals (public API
+unchanged), 136 tests re-verified passing. **Also ruled out at real
+scale**: the tax barely moved (6.59x → 6.68x), and unfiltered latency —
+which this fix cannot possibly affect — moved by almost the same
+proportion, a strong sign the change had no real end-to-end effect once
+folded into everything else the traversal does.
+
+**Where this honestly stands**: three real hypotheses tested across
+four full 1M-scale benchmark runs, each a genuine time cost on real
+hardware. `ef_search` — confirmed real, substantial, partial fix.
+`MAX_FILTERED_VISITS` and per-node hashing cost — both ruled out,
+cleanly, with real evidence. Every cheap, quickly-testable explanation
+is now exhausted. What's left is something structural in how filtered
+graph traversal behaves at 1M+ scale under broad selectivity — most
+plausibly connected to the already-documented Phase 2 property — and
+confirming that needs real profiling instrumentation, not another
+constant tweak. This is a deliberate, honest stopping point for the
+quick-diagnostic phase, not an abandoned thread: documented as a known,
+real, currently-unresolved limitation rather than pursued further
+without a more substantial, dedicated investment.
 
 This is left here, unresolved, on purpose — the same discipline as
 everywhere else in this document. A wrong number that gets corrected

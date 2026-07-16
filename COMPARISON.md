@@ -87,17 +87,18 @@ once at real 1M scale (texmex SIFT-1M, real embeddings, in-process —
 not yet re-run over HTTP at this scale) via
 `cargo run --release --bin bench_neurastore -- bench/data/sift 10 40`:
 
-| Metric | 10K scale | 1M scale (ef_search=40) | 1M scale (ef_search=200) |
-|---|---|---|---|
-| Recall@10 | 0.983 | 0.825 | 0.941 |
-| Filter tax | 1.13–1.32x | 12.62x | 6.59x |
-| Insert throughput | competitive | held up (21,833 vec/sec) | held up (26,000 vec/sec) |
+| Metric | 10K scale | 1M (ef_search=40) | 1M (ef_search=200) | 1M (+max_visits=100K) | 1M (+FxHashMap fix) |
+|---|---|---|---|---|---|
+| Recall@10 | 0.983 | 0.825 | 0.941 | 0.941 | 0.941 |
+| Filter tax | 1.13–1.32x | 12.62x | 6.59x | 7.22x (worse) | 6.68x (unchanged) |
 
-Raising `ef_search` confirmed a real, substantial effect (73% of the
-recall gap recovered, filter tax nearly halved) but not a full fix —
-6.59x is still well short of both the 1.13-1.32x headline number and
-pgvector's own 10K-scale tax (2.6x). A second factor remains
-unaccounted for, most likely the filtered-search visit cap
-(`MAX_FILTERED_VISITS`), not yet tested in isolation. Full honest
-reasoning in `PORTFOLIO.md`.
+Three real hypotheses tested across four full 1M-scale runs.
+`ef_search` — confirmed real, substantial, partial fix. `max_visits`
+and per-node hashing cost — both cleanly ruled out with real evidence,
+including a standalone microbenchmark that measured a genuine ~2.1x
+per-call differential that nonetheless produced no measurable
+end-to-end effect. Every cheap, quickly-testable explanation is now
+exhausted; what remains needs real profiling instrumentation, not
+another constant tweak — documented as a known, honest, currently
+unresolved limitation. Full reasoning in `PORTFOLIO.md`.
 

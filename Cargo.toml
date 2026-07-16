@@ -23,6 +23,14 @@ thiserror = "1"
 rand = "0.8"
 rayon = "=1.8.1"
 rayon-core = "=1.12.1"
+# Non-cryptographic hasher (the same one rustc itself uses internally) for
+# metadata lookups on the filtered-search hot path. Tiny, dependency-free,
+# well-established crate. See vector_index.rs's field_index/metadata doc
+# comments and HISTORY.md's scale investigation for why this is here --
+# a real ~2.1x per-call improvement over std HashMap's SipHash, measured
+# directly against the exact real closure shape via a standalone
+# microbenchmark before touching any production code.
+rustc-hash = "1"
 
 [dev-dependencies]
 tempfile = "=3.10.1"

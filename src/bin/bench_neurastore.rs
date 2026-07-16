@@ -114,6 +114,15 @@ fn main() {
     // tax is a selectivity artifact rather than a fixed cost. See
     // bench/README.md's Phase 4 section for why this matters.
     let cardinality: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(4);
+    // Filtered-search graph-traversal visit budget, overriding the
+    // engine's default (20,000 -- see vector_index.rs's
+    // MAX_FILTERED_VISITS). Added specifically to test a real, open
+    // hypothesis from the 1M-scale investigation: whether that fixed
+    // cap, tuned against a 10K-scale baseline, is itself a contributing
+    // factor to the filter-tax regression at much larger scale,
+    // separate from the already-confirmed ef_search effect. See
+    // HISTORY.md's scale-testing section.
+    let max_visits: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(20_000);
 
     let dir = Path::new(&data_dir);
     // The file prefix matches the directory's own basename -- this is
@@ -254,6 +263,7 @@ fn main() {
     // Phase 0 numbers (pgvector ~2.6x tax, Milvus ~1.1x tax), not just
     // two numbers computed under different conditions.
     println!("\n--- Phase 4: filter tax (WHERE category=X), full corpus ---");
+    println!("Filtered-search visit budget (max_visits): {max_visits}");
 
     let run_unfiltered = |engine: &Engine| -> Vec<f64> {
         let mut latencies = Vec::with_capacity(queries.len());
@@ -269,7 +279,7 @@ fn main() {
         for (i, q) in queries.iter().enumerate() {
             let category = &categories[i % categories.len()];
             let start = Instant::now();
-            engine.search_knn_filtered(q, k, ef_search, "category", &FilterOp::Eq(MetadataValue::String(category.clone())));
+            engine.search_knn_filtered_with_max_visits(q, k, ef_search, "category", &FilterOp::Eq(MetadataValue::String(category.clone())), max_visits);
             latencies.push(start.elapsed().as_secs_f64() * 1000.0);
         }
         latencies
@@ -278,7 +288,7 @@ fn main() {
     // Warm up both paths before measuring either.
     for q in queries.iter().take(20.min(queries.len())) {
         engine.search_knn(q, k, ef_search);
-        engine.search_knn_filtered(q, k, ef_search, "category", &FilterOp::Eq(MetadataValue::String(categories[0].clone())));
+        engine.search_knn_filtered_with_max_visits(q, k, ef_search, "category", &FilterOp::Eq(MetadataValue::String(categories[0].clone())), max_visits);
     }
 
     let order_flip = std::process::id() % 2 == 0; // simple, dependency-free randomization

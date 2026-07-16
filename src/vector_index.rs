@@ -32,6 +32,7 @@ use crate::record::{MetadataValue, Record, RecordId};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use std::cmp::Ordering;
+use rustc_hash::FxHashMap;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
 /// Internal-id + distance pair for the brute-force top-k heap in
@@ -115,7 +116,22 @@ pub struct VectorIndex {
     /// internal HNSW node id -> metadata, parallel to `id_map`. Phase 4:
     /// what makes filtered search possible without going back to the
     /// engine's storage layer for every candidate.
-    metadata: Vec<HashMap<String, MetadataValue>>,
+    ///
+    /// **`FxHashMap`, not `std::collections::HashMap`, as of the 1M-scale
+    /// investigation (see HISTORY.md)**: this is read on every single
+    /// node visited during a filtered graph traversal. A standalone
+    /// microbenchmark against the exact real closure shape (not an
+    /// idealized best case) measured std `HashMap`'s default SipHash at
+    /// ~86.5ns/call versus `FxHashMap`'s ~41.1ns/call for the same
+    /// multi-field lookup -- a real ~2.1x per-call difference, confirmed
+    /// before touching this code, not assumed. SipHash's DoS-resistance
+    /// is irrelevant here (these keys are internal field names, not
+    /// attacker-controlled network input landing directly in a hash
+    /// table). The public API (`insert`'s `&HashMap<String, MetadataValue>`
+    /// parameter, `Record`'s own metadata type) is deliberately
+    /// unchanged -- this is confined to VectorIndex's private internals,
+    /// converted at insert time, not a public type change.
+    metadata: Vec<FxHashMap<String, MetadataValue>>,
     /// external RecordId -> its CURRENT live internal node id. An
     /// update (re-insert of an existing RecordId) changes this mapping
     /// and tombstones the previous internal id.
@@ -129,8 +145,9 @@ pub struct VectorIndex {
     /// path. Not pruned when a node is tombstoned (cheap to check
     /// `tombstoned` at read time instead of maintaining two structures
     /// in lockstep) -- callers must filter tombstoned ids out of
-    /// whatever this returns.
-    field_index: HashMap<String, HashMap<String, Vec<usize>>>,
+    /// whatever this returns. `FxHashMap` for the same reason as
+    /// `metadata` above -- read on the equality fast path.
+    field_index: FxHashMap<String, FxHashMap<String, Vec<usize>>>,
     dim: Option<usize>,
     live_count: usize,
     /// Persists across calls so incremental inserts continue the same
@@ -150,7 +167,7 @@ impl VectorIndex {
             metadata: Vec::with_capacity(records.len()),
             id_to_internal: HashMap::new(),
             tombstoned: HashSet::new(),
-            field_index: HashMap::new(),
+            field_index: FxHashMap::default(),
             dim: None,
             live_count: 0,
             rng: StdRng::seed_from_u64(seed),
@@ -171,7 +188,7 @@ impl VectorIndex {
             metadata: Vec::new(),
             id_to_internal: HashMap::new(),
             tombstoned: HashSet::new(),
-            field_index: HashMap::new(),
+            field_index: FxHashMap::default(),
             dim: None,
             live_count: 0,
             rng: StdRng::seed_from_u64(seed),
@@ -205,7 +222,11 @@ impl VectorIndex {
 
         let new_internal = self.hnsw.insert(vector.to_vec(), &mut self.rng);
         self.id_map.push(id);
-        self.metadata.push(metadata.clone());
+        // Converts from the public API's std HashMap into the internal
+        // FxHashMap -- a one-time cost per insert, not per query. See
+        // this struct's `metadata` field doc comment for why the
+        // internal representation differs from the public parameter type.
+        self.metadata.push(metadata.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
         for (field, value) in metadata {
             self.field_index
                 .entry(field.clone())
@@ -312,6 +333,30 @@ impl VectorIndex {
         field: &str,
         op: &FilterOp,
     ) -> Vec<(RecordId, f32)> {
+        self.search_filtered_with_max_visits(query, k, ef_search, field, op, MAX_FILTERED_VISITS)
+    }
+
+    /// Same as `search_filtered`, with the graph-traversal visit budget
+    /// exposed explicitly instead of defaulting to `MAX_FILTERED_VISITS`.
+    /// Added specifically to test a real, open hypothesis from the 1M-scale
+    /// investigation (see HISTORY.md): whether the fixed 20,000-visit cap,
+    /// tuned against a 10K-scale baseline, is itself a real contributing
+    /// factor to the filter-tax regression at 1M scale, separate from the
+    /// already-confirmed `ef_search` effect. Deliberately not (yet) wired
+    /// through the HTTP API/client/CLI -- exposing a parameter broadly
+    /// before confirming it's actually worth exposing would be the same
+    /// mistake Phase 10 avoided by testing `#[serde(untagged)]` against
+    /// bincode with a five-line script before building anything on top of
+    /// the wrong assumption. Test first, build the full apparatus after.
+    pub fn search_filtered_with_max_visits(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        field: &str,
+        op: &FilterOp,
+        max_visits: usize,
+    ) -> Vec<(RecordId, f32)> {
         if let FilterOp::Eq(target) = op {
             let key = target.canonical_key();
             let candidate_internal_ids: Vec<usize> = self
@@ -414,7 +459,7 @@ impl VectorIndex {
         };
 
         self.hnsw
-            .search_filtered(query, k, ef_search, &filter, MAX_FILTERED_VISITS)
+            .search_filtered(query, k, ef_search, &filter, max_visits)
             .into_iter()
             .map(|(internal_id, dist)| (self.id_map[internal_id], dist))
             .collect()
@@ -682,6 +727,52 @@ mod tests {
         }
         let results = index.search_filtered(&[5.0, 5.0], 10, 100, "price", &FilterOp::Gte(90.0));
         assert!(!results.is_empty(), "should find at least some matches with a 10%-selectivity range filter over 200 records");
+    }
+
+    #[test]
+    fn search_filtered_with_max_visits_matches_default_when_given_the_same_budget() {
+        // search_filtered() is documented as delegating to
+        // search_filtered_with_max_visits() using MAX_FILTERED_VISITS
+        // (20,000) as the budget -- this proves that delegation is real,
+        // not just claimed in a doc comment: calling the explicit-budget
+        // version with 20,000 must produce identical results to calling
+        // the default version on the same data and query.
+        let mut index = VectorIndex::empty(HnswParams::default(), 1);
+        let mut rng_seed = 5u64;
+        for id in 0..300u64 {
+            rng_seed = rng_seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let price = (rng_seed % 100) as f64;
+            index.insert(id, &[(id % 20) as f32, (id / 20) as f32], &HashMap::from([("price".to_string(), MetadataValue::Number(price))]));
+        }
+        let via_default = index.search_filtered(&[5.0, 5.0], 10, 100, "price", &FilterOp::Gte(50.0));
+        let via_explicit = index.search_filtered_with_max_visits(&[5.0, 5.0], 10, 100, "price", &FilterOp::Gte(50.0), 20_000);
+        assert_eq!(via_default, via_explicit, "the default budget path and the explicit-20000 path must agree exactly");
+    }
+
+    #[test]
+    fn a_smaller_visit_budget_can_reduce_broad_filtered_search_result_count() {
+        // Proves the max_visits parameter genuinely constrains the graph
+        // traversal, not just that the plumbing compiles -- a tiny budget
+        // on a large, broad-selectivity dataset should visibly cap how
+        // much of the graph gets explored, unlike a generous budget on
+        // the same data/query.
+        let mut index = VectorIndex::empty(HnswParams::default(), 1);
+        let mut rng_seed = 11u64;
+        for id in 0..2000u64 {
+            rng_seed = rng_seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let category = if rng_seed % 2 == 0 { "a" } else { "b" }; // ~50% selectivity, broad
+            let x = (id % 45) as f32;
+            let y = (id / 45) as f32;
+            index.insert(id, &[x, y], &HashMap::from([("category".to_string(), MetadataValue::String(category.to_string()))]));
+        }
+        let tiny_budget = index.search_filtered_with_max_visits(&[0.0, 0.0], 10, 50, "category", &FilterOp::Eq(MetadataValue::String("a".to_string())), 5);
+        let generous_budget = index.search_filtered_with_max_visits(&[0.0, 0.0], 10, 50, "category", &FilterOp::Eq(MetadataValue::String("a".to_string())), 20_000);
+        assert!(
+            tiny_budget.len() <= generous_budget.len(),
+            "a 5-visit budget should never find MORE matches than a 20,000-visit budget on the same broad filter: tiny={}, generous={}",
+            tiny_budget.len(),
+            generous_budget.len()
+        );
     }
 
     #[test]

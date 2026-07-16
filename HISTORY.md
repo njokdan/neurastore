@@ -1208,12 +1208,93 @@ causal path to affecting build time. Most likely ordinary variance on
 a real, shared machine, not a real finding -- noted rather than
 silently treated as meaningful.
 
-**Next step, not yet run**: `MAX_FILTERED_VISITS` (currently a
-compile-time constant, `vector_index.rs`) needs its own isolated test,
-increased independently of `ef_search`, to determine whether it
-explains the remaining filter-tax gap or whether the deeper
-graph-connectivity hypothesis is the real cause. Left here, unresolved,
-on purpose: a wrong number quietly corrected is a worse pattern than a
-real problem reported honestly while still under investigation, the
-same discipline as every other finding in this document.
+**Diagnostic run 2 (`max_visits` 20,000 -> 100,000, `ef_search=200` held
+constant from diagnostic 1), real result on the user's machine**:
+
+| Metric | max_visits=20,000 | max_visits=100,000 |
+|---|---|---|
+| Unfiltered p50 (filter-tax comparison) | 2.086ms | 2.136ms (+2.4%, noise-level) |
+| Filtered p50 | 13.742ms | 15.422ms (+12.2%, real, not noise) |
+| Filter tax | 6.59x | **7.22x (worse, not better)** |
+| Unfiltered recall@10 | 0.941 | 0.941 (unchanged, expected -- `max_visits` only touches the filtered path) |
+
+**`MAX_FILTERED_VISITS` is ruled out as a real driver of the regression**
+-- a genuinely useful negative result, not a dead end. A 5x larger visit
+budget produced no recall or tax improvement, and the filtered path
+actually got measurably slower while the unfiltered baseline barely
+moved. The graph traversal isn't finding better matches by exploring
+more of the graph at 1M scale -- it's doing more work for a similar
+outcome. Both of the "just turn up a runtime constant" hypotheses are
+now exhausted; what remains is more structural.
+
+**A third hypothesis, tested cheaply in the sandbox before touching any
+production code**: rather than the *number* of nodes visited, is the
+*cost per visited node* itself the bottleneck? The filtered-search
+closure (`vector_index.rs`) does a `HashSet` lookup plus a per-record,
+string-keyed `HashMap::get()` on every single node the traversal
+touches. A standalone microbenchmark, built specifically to match the
+real closure's exact shape (not an idealized best case), measured std
+`HashMap`'s default SipHash at ~86.5ns/call versus `FxHashMap`'s
+~41.1ns/call for the identical multi-field lookup -- a real, consistent
+~2.1x per-call difference, confirmed with real numbers before writing
+any production code, matching the same discipline as testing
+`#[serde(untagged)]` against bincode in Phase 10 before building on top
+of an untested assumption.
+
+**Fix implemented, confined entirely to `VectorIndex`'s private
+internals**: `metadata` and `field_index` now use `FxHashMap` instead
+of `std::collections::HashMap`. SipHash's DoS-resistance is irrelevant
+here -- these are internal field names, never attacker-controlled input
+landing directly in a hash table. The public API is unchanged: `insert`
+still takes `&HashMap<String, MetadataValue>` (the std type, matching
+`Record`'s own type), converted into the internal `FxHashMap`
+representation at insert time -- a one-time per-insert cost, not a
+per-query one. 136 Rust tests re-verified passing, zero behavior
+change, zero public API change -- a real, low-risk, well-justified
+optimization, not a speculative rewrite.
+
+**Diagnostic run 3 (`FxHashMap` fix, same `ef_search=200`, `max_visits`
+back at its default 20,000), real result on the user's machine**:
+
+| Metric | Before fix (diagnostic 1) | After `FxHashMap` fix |
+|---|---|---|
+| Unfiltered p50 (filter-tax comparison) | 2.086ms | 2.274ms (+9%) |
+| Filtered p50 | 13.742ms | 15.201ms (+10.6%) |
+| Filter tax | 6.59x | 6.68x (+1.4% -- essentially unchanged) |
+
+**Ruled out.** The tax barely moved, and critically, *unfiltered*
+latency (which the hasher change cannot possibly affect -- unfiltered
+search never touches `metadata`/`field_index`) moved by almost the same
+proportion as filtered latency. That's a strong tell this run's
+higher numbers across the board are ordinary system variance on a real,
+shared machine, not a real effect of the fix. The microbenchmark's
+~2.1x per-call differential was real and honestly measured -- it just
+didn't translate into a measurable end-to-end improvement once folded
+into everything else the real traversal does.
+
+**Where this investigation honestly stands after three real,
+independently tested hypotheses**: `ef_search` -- confirmed real,
+substantial, partial fix. `MAX_FILTERED_VISITS` -- ruled out, no help.
+Per-node hashing cost -- ruled out, no measurable end-to-end effect
+despite a real isolated microbenchmark differential. Every cheap,
+plausible, quickly-testable explanation has now been genuinely
+exhausted across four full 1M-scale benchmark runs, each a real,
+substantial time cost on real hardware.
+
+**What's left is a different, bigger kind of work, not a fifth quick
+test**: the remaining, most likely explanation is something structural
+in how the graph traversal behaves under a broad-selectivity filter at
+1M+ scale -- most plausibly connected to the already-documented Phase 2
+property (`sparse_clusters_can_strand_a_whole_cluster_from_the_entry_point`).
+Confirming that would need real profiling instrumentation -- counting
+actual wasted visits during a filtered traversal, or otherwise
+characterizing where the traversal's budget is actually being spent --
+not another constant tweak. This is a legitimate, honest stopping point
+for the quick-diagnostic phase of this investigation: three real
+hypotheses tested and resolved (one partial fix, two clean negatives),
+left here as a documented, known limitation rather than pursued further
+without a more substantial, dedicated investment. A wrong number
+quietly corrected is a worse pattern than a real problem reported
+honestly -- and so is quietly abandoning an investigation without
+recording where it actually got to.
 
