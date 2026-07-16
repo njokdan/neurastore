@@ -114,6 +114,56 @@ narrow niche (single-node hybrid vector + filter search), not a
 head-to-head replacement for systems built for a different scale
 entirely.
 
+## A real finding at 1M scale, not yet resolved — reported in full, not softened
+
+Every number in this document up to this point was measured at ~10K
+records — every doc in this project carried an honest "untested past
+that scale" caveat. That caveat is now tested, on the real texmex
+SIFT-1M corpus (1,000,000 real embeddings, not synthetic data), and the
+result is genuinely mixed — reported here exactly as found, including
+the part that isn't good news:
+
+| Metric | 10K scale (established) | 1M scale (real, just measured) |
+|---|---|---|
+| Recall@10 | 0.983 | 0.825 |
+| Filter tax | 1.13–1.32x | **12.62x** |
+| Insert throughput | held up | held up (21,833 vec/sec) |
+| Max query latency (unfiltered) | sub-5ms | 28.7–91.2ms |
+| Max query latency (filtered) | — | 665.7ms |
+
+The filter tax result is the one that matters most: at 1M scale it's
+worse than pgvector's *own* tax at only 10K scale — a direct hit on
+this project's headline claim, not a minor regression. Insert
+throughput held up fine, and — a genuinely useful side confirmation — a
+cheaper synthetic test at 200K scale (recall numbers meaningless on
+synthetic data, as always, but its incremental-insert throughput
+prediction of ~380-435 vec/sec landed almost exactly on the real
+result, 449 vec/sec) correctly predicted the *structural* behavior even
+where it couldn't predict recall.
+
+**Confirmed by a single-variable diagnostic, not just hypothesized**:
+`ef_search` (40, tuned against the 10K baseline methodology) was
+genuinely too small a search budget at 1M scale. Raising it to 200
+recovered 73% of the recall gap (0.825 → 0.941, versus 0.983 at 10K)
+and nearly halved the filter tax (12.62x → 6.59x) — a real,
+substantial, single-variable effect, not noise.
+
+**Not fully resolved by that alone**: even at 5x the original
+`ef_search`, the filter tax (6.59x) is still roughly 5x worse than this
+project's actual headline number and still worse than pgvector's own
+tax at 10K scale. A second factor remains — most likely the
+filtered-search visit cap (`MAX_FILTERED_VISITS = 20,000`, untouched by
+this test and specific to the filtered path only), or a real
+scale-dependent graph-connectivity cost related to an already-documented
+Phase 2 property (`sparse_clusters_can_strand_a_whole_cluster_from_the_entry_point`)
+that would plausibly worsen, not improve, as the graph grows. The next
+real step is an isolated test of the visit cap on its own.
+
+This is left here, unresolved, on purpose — the same discipline as
+everywhere else in this document. A wrong number that gets corrected
+quietly is a worse pattern than a real problem reported honestly while
+still being investigated.
+
 ## What's deliberately not built, and why
 
 - **gRPC** — a real, understood tradeoff (binary encoding, generated

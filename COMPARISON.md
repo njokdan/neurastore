@@ -79,3 +79,25 @@ protocols) rather than something either side did wrong.
    already-built index) instead of a true fresh bulk load.
 
 Every number in the table above reflects the corrected methodology.
+
+## At 1M scale — a real, unresolved finding, not yet folded into the headline table above
+
+Every number above was measured at ~10K records (siftsmall). Tested
+once at real 1M scale (texmex SIFT-1M, real embeddings, in-process —
+not yet re-run over HTTP at this scale) via
+`cargo run --release --bin bench_neurastore -- bench/data/sift 10 40`:
+
+| Metric | 10K scale | 1M scale (ef_search=40) | 1M scale (ef_search=200) |
+|---|---|---|---|
+| Recall@10 | 0.983 | 0.825 | 0.941 |
+| Filter tax | 1.13–1.32x | 12.62x | 6.59x |
+| Insert throughput | competitive | held up (21,833 vec/sec) | held up (26,000 vec/sec) |
+
+Raising `ef_search` confirmed a real, substantial effect (73% of the
+recall gap recovered, filter tax nearly halved) but not a full fix —
+6.59x is still well short of both the 1.13-1.32x headline number and
+pgvector's own 10K-scale tax (2.6x). A second factor remains
+unaccounted for, most likely the filtered-search visit cap
+(`MAX_FILTERED_VISITS`), not yet tested in isolation. Full honest
+reasoning in `PORTFOLIO.md`.
+

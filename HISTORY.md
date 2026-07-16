@@ -1098,3 +1098,122 @@ format survives a real disk round-trip through the actual WAL/SSTable
 pipeline, not just an in-memory session. Repeated the full workflow
 again through the actual installed CLI binary with identical results.
 
+## Investigation: real scale testing at 1M vectors (in progress, real problem found)
+
+Every benchmark in this project up to this point ran at ~10K records
+(siftsmall) — every honest-gaps document carried the same
+"untested past that scale" caveat. Rather than build a second HNSW
+index type (IVF) speculatively against an assumed scale problem, tested
+the assumption directly first: real texmex SIFT-1M corpus (1,000,000
+real embeddings), same `bench_neurastore` binary used throughout this
+project's benchmarking.
+
+**A real bug found and fixed before the real test could even run**:
+`bench_neurastore.rs` hardcoded its dataset file prefix to
+`"siftsmall_"` regardless of which directory was passed. The real
+sift1m extraction produces files prefixed `sift_`, not `sift1m_` or
+`siftsmall_` -- this would have silently failed after a 500MB download
+if not caught first. Fixed by deriving the prefix from the dataset
+directory's own basename, matching how `prepare_dataset.py` already
+lays out every SIFT-family dataset. Verified against both naming
+conventions with a small hand-built `.fvecs`/`.ivecs` fixture before
+trusting it with the real download.
+
+**A smaller, sandbox-feasible test first, to validate methodology before
+the real one**: the sandbox environment used for most of this project's
+development has no network access to the SIFT corpus host (confirmed:
+direct connection attempt times out, blocked by sandbox egress
+restrictions) and only 1 CPU core / ~3.7GB RAM -- not enough to
+complete a real 1M build in reasonable time. Generated a 200K-vector
+synthetic dataset (dim=128, matching real SIFT dimensionality) instead,
+specifically to validate the benchmark methodology and get directional
+build-time/memory data, while being explicit that its recall number
+would be meaningless (the same, already-documented Phase 0 finding:
+unstructured synthetic Gaussian vectors cause recall collapse from the
+curse of dimensionality, unrelated to any real engine problem).
+First memory-measurement attempt was itself buggy (a process-tracking
+error produced an obviously-wrong 1.9MB reading) -- caught by sanity-checking
+the number against the known data size before reporting it, not
+reported as-is. Corrected measurement: 618MB peak RSS for 200K vectors,
+a real, plausible number. HNSW build time for 160K vectors: ~150s on
+one core.
+
+**The real result, on the user's own machine (more cores/RAM than the
+sandbox), 1,000,000 real SIFT vectors**:
+
+| Metric | 10K scale (established) | 1M scale (just measured) |
+|---|---|---|
+| Recall@10 | 0.983 | 0.825 |
+| Filter tax | 1.13-1.32x | **12.62x** |
+| Insert throughput (batched) | competitive | held up: 21,833 vec/sec |
+| HNSW build time (800K vectors) | seconds | ~1,083s (~18 min) |
+| Incremental insert throughput (post-build) | -- | 449 vec/sec |
+
+**A genuine, useful cross-check**: the sandbox's 200K synthetic test's
+incremental-insert-throughput prediction (~380-435 vec/sec, from a run
+whose recall number was already known to be meaningless) landed almost
+exactly on the real 1M result (449 vec/sec) -- confirming the cheaper
+synthetic test's *structural* signal was trustworthy even where its
+*recall* signal deliberately wasn't trusted.
+
+**The real problem, reported in full, not softened**: recall dropped
+from 0.983 to 0.825, and the filter tax -- this project's central,
+headline claim -- degraded from 1.13-1.32x to 12.62x, worse than
+pgvector's own tax measured at only 10K scale. This is a direct,
+material regression in the property this whole project was built
+around, at a scale that matters.
+
+**Working hypothesis, explicitly not yet confirmed**: `ef_search` (40)
+and the filtered-search visit cap (`MAX_FILTERED_VISITS = 20,000`, see
+`vector_index.rs`) are both fixed constants, matched to the pgvector/Milvus
+baseline methodology at 10K scale. At 1M records with a ~25%-selectivity
+filter (~250,000 matching candidates), a 20,000-node visit budget may
+not be enough of the graph to find good matches efficiently at 100x the
+scale these constants were ever tuned against. A plausible, related
+factor: Phase 2 already documented a real, unfixed HNSW property
+(`hnsw::tests::sparse_clusters_can_strand_a_whole_cluster_from_the_entry_point`)
+-- sparse upper-layer graph connectivity stranding whole clusters from
+the entry point -- which would plausibly worsen, not improve, as the
+graph grows, since upper-layer density relative to total node count
+thins out at scale.
+
+**Diagnostic run 1 (ef_search 40 -> 200, single-variable test, MAX_FILTERED_VISITS
+left untouched), real result on the user's machine**:
+
+| Metric | ef_search=40 | ef_search=200 | 10K baseline |
+|---|---|---|---|
+| Unfiltered recall@10 | 0.825 | **0.941** | 0.983 |
+| Filter tax | 12.62x | **6.59x** | 1.13-1.32x |
+| Unfiltered p50 latency | 0.575ms | 1.908ms | sub-ms |
+| Filtered p50 latency | 7.429ms | 13.742ms | -- |
+
+**Confirmed**: `ef_search=40` was genuinely too small a search budget at
+1M scale -- recall recovered 73% of the gap to the 10K baseline, and
+the filter tax nearly halved, both real, substantial, single-variable
+effects, not noise.
+
+**Not fully resolved**: even at 5x the original `ef_search`, recall is
+still short of 0.983 and the filter tax (6.59x) is still roughly 5x
+worse than the actual headline number and still worse than pgvector's
+own tax at 10K scale. `ef_search` alone does not fully explain the
+regression -- a second factor remains, most likely
+`MAX_FILTERED_VISITS` (untouched by this test, and specific to the
+filtered path only) or a real, scale-dependent graph-connectivity cost.
+
+**One number flagged as probably noise, not signal, rather than quietly
+accepted**: build time rose from 1,083s to 1,470s between these two
+runs. Build time is governed by `ef_construction` (fixed at 64,
+untouched by this test) -- `ef_search` is query-time only and has no
+causal path to affecting build time. Most likely ordinary variance on
+a real, shared machine, not a real finding -- noted rather than
+silently treated as meaningful.
+
+**Next step, not yet run**: `MAX_FILTERED_VISITS` (currently a
+compile-time constant, `vector_index.rs`) needs its own isolated test,
+increased independently of `ef_search`, to determine whether it
+explains the remaining filter-tax gap or whether the deeper
+graph-connectivity hypothesis is the real cause. Left here, unresolved,
+on purpose: a wrong number quietly corrected is a worse pattern than a
+real problem reported honestly while still under investigation, the
+same discipline as every other finding in this document.
+
