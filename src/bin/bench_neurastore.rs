@@ -123,6 +123,7 @@ fn main() {
     // separate from the already-confirmed ef_search effect. See
     // HISTORY.md's scale-testing section.
     let max_visits: usize = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(20_000);
+    let brute_force_threshold: usize = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(3_000);
 
     let dir = Path::new(&data_dir);
     // The file prefix matches the directory's own basename -- this is
@@ -264,6 +265,7 @@ fn main() {
     // two numbers computed under different conditions.
     println!("\n--- Phase 4: filter tax (WHERE category=X), full corpus ---");
     println!("Filtered-search visit budget (max_visits): {max_visits}");
+    println!("Brute-force fast-path threshold: {brute_force_threshold} candidates (default: 3,000)");
 
     let run_unfiltered = |engine: &Engine| -> Vec<f64> {
         let mut latencies = Vec::with_capacity(queries.len());
@@ -279,7 +281,7 @@ fn main() {
         for (i, q) in queries.iter().enumerate() {
             let category = &categories[i % categories.len()];
             let start = Instant::now();
-            engine.search_knn_filtered_with_max_visits(q, k, ef_search, "category", &FilterOp::Eq(MetadataValue::String(category.clone())), max_visits);
+            engine.search_knn_filtered_with_max_visits_and_threshold(q, k, ef_search, "category", &FilterOp::Eq(MetadataValue::String(category.clone())), max_visits, brute_force_threshold);
             latencies.push(start.elapsed().as_secs_f64() * 1000.0);
         }
         latencies
@@ -288,7 +290,7 @@ fn main() {
     // Warm up both paths before measuring either.
     for q in queries.iter().take(20.min(queries.len())) {
         engine.search_knn(q, k, ef_search);
-        engine.search_knn_filtered_with_max_visits(q, k, ef_search, "category", &FilterOp::Eq(MetadataValue::String(categories[0].clone())), max_visits);
+        engine.search_knn_filtered_with_max_visits_and_threshold(q, k, ef_search, "category", &FilterOp::Eq(MetadataValue::String(categories[0].clone())), max_visits, brute_force_threshold);
     }
 
     let order_flip = std::process::id() % 2 == 0; // simple, dependency-free randomization
@@ -348,6 +350,7 @@ fn main() {
             "category",
             &FilterOp::Eq(MetadataValue::String(category.clone())),
             max_visits,
+            brute_force_threshold,
         ) {
             if stats.nodes_visited == 0 {
                 brute_force_path_count += 1;

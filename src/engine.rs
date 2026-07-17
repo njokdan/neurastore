@@ -349,6 +349,27 @@ impl Engine {
     }
 
     /// Same as `search_knn_filtered_with_max_visits`, additionally
+    /// exposing `BRUTE_FORCE_THRESHOLD` explicitly -- see
+    /// `VectorIndex::search_filtered_with_max_visits_and_threshold`'s
+    /// doc comment for the hypothesis this exists to test.
+    pub fn search_knn_filtered_with_max_visits_and_threshold(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        field: &str,
+        op: &FilterOp,
+        max_visits: usize,
+        brute_force_threshold: usize,
+    ) -> Option<Vec<(RecordId, f32)>> {
+        self.vector_index.as_ref().map(|idx| {
+            idx.read()
+                .expect("vector index lock poisoned")
+                .search_filtered_with_max_visits_and_threshold(query, k, ef_search, field, op, max_visits, brute_force_threshold)
+        })
+    }
+
+    /// Same as `search_knn_filtered_with_max_visits`, additionally
     /// reporting graph-traversal visit/match statistics -- see
     /// `VectorIndex::search_filtered_with_stats`'s doc comment for the
     /// hypothesis this exists to test.
@@ -360,11 +381,12 @@ impl Engine {
         field: &str,
         op: &FilterOp,
         max_visits: usize,
+        brute_force_threshold: usize,
     ) -> Option<(Vec<(RecordId, f32)>, crate::vector_index::FilteredSearchStats)> {
         self.vector_index.as_ref().map(|idx| {
             idx.read()
                 .expect("vector index lock poisoned")
-                .search_filtered_with_stats(query, k, ef_search, field, op, max_visits)
+                .search_filtered_with_stats(query, k, ef_search, field, op, max_visits, brute_force_threshold)
         })
     }
 

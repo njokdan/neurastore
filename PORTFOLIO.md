@@ -190,12 +190,30 @@ equivalent unfiltered search would need — a real, inherent cost of
 pushing a moderately-selective predicate into graph traversal, not a
 defect. It explains why the tax was small at 10K scale (a 4x multiplier
 on tiny absolute visit counts costs little) and large at 1M scale (the
-same multiplier on a much bigger base costs much more). Five full
-1M-scale benchmark runs, real machine time, a real answer at the end —
-not the one hoped for at the start, but a true one, and a genuinely
-better-justified case for a real metadata-partitioned filtering
-architecture (closer to why a second index type like IVF might actually
-be worth building) than existed before this investigation began.
+same multiplier on a much bigger base costs much more).
+
+**One cheap fix left to test, and it made things decisively worse**:
+before committing to a whole new architecture, tested whether the
+existing parallelized brute-force path — already built, just never
+tried above 3,000 candidates — would simply beat graph traversal at the
+real ~250,000-candidate scale. A small synthetic smoke test suggested
+yes (tax dropped to 0.27x); the real 1M test said clearly no (tax rose
+to 14.21x, worse than graph traversal's 6.59x). The reason the smoke
+test misled: brute force means examining every candidate, and at
+250,000 real candidates that's ~32 million distance computations per
+query — over 32x more raw work than the ~7,800 the graph traversal
+actually needs, since avoiding exactly that is the whole point of graph
+traversal. Parallelism across a handful of cores can't close a 32x gap.
+
+Six full 1M-scale benchmark runs, real machine time at every step, and
+every cheap hypothesis — `ef_search`, `MAX_FILTERED_VISITS`, per-node
+hashing cost, and now raising the brute-force threshold — has been
+tested and either partially confirmed or cleanly ruled out. What's left
+is a real algorithmic change, not a tuning knob: a metadata-partitioned
+filtering architecture (closer to why a second index type like IVF
+might actually be worth building), now backed by evidence that ruled
+out every cheaper alternative first, not just intuition that it might
+help.
 
 ## What's deliberately not built, and why
 

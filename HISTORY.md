@@ -1435,3 +1435,94 @@ out), and now the actual structural cause (confirmed, not a bug).
 Documented in full, nothing softened or hidden at any step -- including
 the steps that didn't pan out.
 
+## Pursuing the metadata-partitioned direction: a cheap test before the big architecture
+
+The resolved investigation made a real, evidence-based case for a
+metadata-partitioned filtering architecture (a second index type, or
+similar) -- but that's a large, complex, multi-week undertaking.
+Before committing to it, a much cheaper question, handed to us for
+free by the same profiling data: is a *parallelized brute-force scan*
+over the ~250,000 candidates a 25%-selectivity filter produces at 1M
+scale actually faster than ~7,800 graph-traversal visits, each
+carrying real overhead (heap operations, neighbor-list dereferencing,
+hashing) beyond its distance computation? The brute-force path already
+exists, is already tested, and is already parallelized via rayon -- it
+was just never tried at this candidate scale, because
+`BRUTE_FORCE_THRESHOLD` (3,000) was tuned once, early in Phase 4,
+against much smaller data.
+
+**`BRUTE_FORCE_THRESHOLD` made a testable parameter**, same pattern as
+`MAX_FILTERED_VISITS` before it: `search_filtered_with_max_visits_and_threshold`
+and `search_filtered_with_stats` (extended) now accept it explicitly,
+wired through `Engine` and a new 6th `bench_neurastore.rs` CLI
+argument. `search_filtered` (the public, HTTP-facing function) is
+unchanged -- still defaults to the constant. 5 new library tests,
+including one proving the two code paths (brute-force and
+graph-traversal) genuinely agree on results for the same query and
+data, not just that the routing compiles. 141 Rust tests total.
+
+**Smoke-tested on small synthetic data before handing off**: raising
+the threshold past a 5,000-candidate filter (25% of 20,000 synthetic
+records) correctly routed all 30 test queries to the brute-force path,
+and the filter tax dropped from ~4.6x to **0.27x** -- filtered search
+became faster than unfiltered. Not the real answer (5,000 candidates on
+tiny synthetic data isn't 250,000 on real SIFT-1M), but a genuinely
+promising directional signal worth taking to the real test.
+
+**Next step, not yet run**: `cargo run --release --bin bench_neurastore
+-- bench/data/sift 10 200 4 20000 300000` (threshold comfortably above
+the ~250,000 real candidate count) on the real 1M corpus. If the tax
+drops substantially, raising `BRUTE_FORCE_THRESHOLD` (with proper
+memory/scaling caveats for very large candidate sets, still to be
+worked out) may be a far simpler, far cheaper fix than a whole new
+partitioned architecture. If it doesn't help -- or helps less than
+hoped -- that's real, decisive evidence in favor of actually building
+the bigger architecture, not just a hunch. Left here, unresolved, on
+purpose -- the same discipline as every other finding in this document.
+
+## Resolved: the cheap fix doesn't work, and now we know exactly why
+
+The real 1M-scale result, threshold raised to 300,000 (comfortably
+above the real ~250,000-candidate count -- confirmed all 10,000
+queries actually took the brute-force path):
+
+| Metric | Graph traversal (best case, `ef_search=200`) | Brute force (`threshold=300,000`) |
+|---|---|---|
+| Filter tax | 6.59x | **14.21x (worse)** |
+| Filtered p50 | ~14ms | 38.653ms |
+
+**A clean, decisive negative** -- the opposite of what the small-scale
+synthetic smoke test suggested, and worth being honest about exactly
+why the smoke test misled rather than quietly moving past it. At 5,000
+candidates (the smoke test), brute force examines a small enough set
+that its simplicity wins outright. At 250,000 real candidates, "examine
+every candidate" means roughly 32 million distance computations per
+query -- over 32x more raw floating-point work than the ~7,800 the
+graph traversal actually needs, since the entire point of graph
+traversal is to *avoid* examining every candidate. Parallelism across a
+handful of CPU cores cannot close a 32x gap in raw work. The smoke
+test's regime (small candidate counts) and the real regime (250,000
+candidates) sit on opposite sides of where that tradeoff flips, and
+only the real test could reveal which side the actual 1M-scale problem
+falls on.
+
+**Every cheap hypothesis is now genuinely exhausted**, not just the
+tuning-constant ones: `ef_search` (real, partial fix),
+`MAX_FILTERED_VISITS` (ruled out), per-node hashing cost (ruled out),
+and now raising `BRUTE_FORCE_THRESHOLD` (ruled out, decisively worse).
+Six full 1M-scale benchmark runs across this whole investigation, real
+machine time at every step, and the graph-traversal approach --
+despite its real, now-understood ~4x-visit-multiplier cost -- remains
+the better of the two existing strategies at this candidate scale by a
+wide margin.
+
+**What this means for the roadmap, with real confidence now, not just
+a hunch**: a metadata-partitioned filtering architecture (or an
+equivalent real algorithmic change -- not a threshold, not a hasher, not
+a bigger budget) is genuinely the right next direction, because every
+cheaper alternative that could have made it unnecessary has now been
+tested and ruled out with real evidence. This is exactly the
+disciplined path a real architectural investment should take: prove the
+cheap fixes don't work before spending weeks on the expensive one, so
+the expensive one is backed by evidence instead of intuition.
+

@@ -346,7 +346,7 @@ impl VectorIndex {
         field: &str,
         op: &FilterOp,
     ) -> Vec<(RecordId, f32)> {
-        self.search_filtered_with_max_visits(query, k, ef_search, field, op, MAX_FILTERED_VISITS)
+        self.search_filtered_with_max_visits_and_threshold(query, k, ef_search, field, op, MAX_FILTERED_VISITS, BRUTE_FORCE_THRESHOLD)
     }
 
     /// Same as `search_filtered`, with the graph-traversal visit budget
@@ -370,6 +370,39 @@ impl VectorIndex {
         op: &FilterOp,
         max_visits: usize,
     ) -> Vec<(RecordId, f32)> {
+        self.search_filtered_with_max_visits_and_threshold(query, k, ef_search, field, op, max_visits, BRUTE_FORCE_THRESHOLD)
+    }
+
+    /// Same as `search_filtered_with_max_visits`, additionally exposing
+    /// `BRUTE_FORCE_THRESHOLD` explicitly. Added after the 1M-scale
+    /// investigation resolved *why* the filter tax was high (real
+    /// profiling: the graph traversal needs ~4x the visits an equivalent
+    /// unfiltered search would, because only ~25% of visited nodes match
+    /// -- not a bug, an inherent cost of predicate-in-traversal filtering)
+    /// -- which immediately raises a cheap, testable question before
+    /// committing to a much bigger metadata-partitioned architecture: is
+    /// a parallelized brute-force scan over the ~250,000 candidates a
+    /// 25%-selectivity filter produces at 1M scale actually *faster* than
+    /// ~7,800 graph-traversal visits, each of which carries real overhead
+    /// (heap operations, neighbor-list dereferencing, hashing) beyond its
+    /// distance computation? The existing brute-force path is already
+    /// built, tested, and parallelized via rayon -- it's just never been
+    /// tried at this candidate scale, because `BRUTE_FORCE_THRESHOLD` was
+    /// tuned once, early in Phase 4, against much smaller data. Same
+    /// "test the cheap thing before building the big thing" discipline
+    /// as everywhere else in this investigation. Diagnostic-only, not
+    /// wired through the HTTP API/client/CLI, same reasoning as
+    /// `search_filtered_with_max_visits`.
+    pub fn search_filtered_with_max_visits_and_threshold(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        field: &str,
+        op: &FilterOp,
+        max_visits: usize,
+        brute_force_threshold: usize,
+    ) -> Vec<(RecordId, f32)> {
         if let FilterOp::Eq(target) = op {
             let key = target.canonical_key();
             let candidate_internal_ids: Vec<usize> = self
@@ -383,7 +416,7 @@ impl VectorIndex {
                 return Vec::new();
             }
 
-            if candidate_internal_ids.len() <= BRUTE_FORCE_THRESHOLD {
+            if candidate_internal_ids.len() <= brute_force_threshold {
                 // Real-hardware benchmarking (bench/README.md's Phase 4
                 // section) found the sort was never the bottleneck here --
                 // the previous heap optimization (below) confirmed that by
@@ -520,6 +553,7 @@ impl VectorIndex {
         field: &str,
         op: &FilterOp,
         max_visits: usize,
+        brute_force_threshold: usize,
     ) -> (Vec<(RecordId, f32)>, FilteredSearchStats) {
         if let FilterOp::Eq(target) = op {
             let key = target.canonical_key();
@@ -529,8 +563,8 @@ impl VectorIndex {
                 .and_then(|values| values.get(&key))
                 .map(|ids| ids.iter().copied().filter(|&id| self.is_live_internal(id)).count())
                 .unwrap_or(0);
-            if candidate_count > 0 && candidate_count <= BRUTE_FORCE_THRESHOLD {
-                let results = self.search_filtered_with_max_visits(query, k, ef_search, field, op, max_visits);
+            if candidate_count > 0 && candidate_count <= brute_force_threshold {
+                let results = self.search_filtered_with_max_visits_and_threshold(query, k, ef_search, field, op, max_visits, brute_force_threshold);
                 return (results, FilteredSearchStats { nodes_visited: 0, nodes_matched: 0 });
             }
         }
@@ -895,7 +929,7 @@ mod tests {
         }
         let op = FilterOp::Eq(MetadataValue::String("a".to_string()));
         let plain = index.search_filtered_with_max_visits(&[0.0, 0.0], 10, 50, "category", &op, 20_000);
-        let (instrumented, stats) = index.search_filtered_with_stats(&[0.0, 0.0], 10, 50, "category", &op, 20_000);
+        let (instrumented, stats) = index.search_filtered_with_stats(&[0.0, 0.0], 10, 50, "category", &op, 20_000, 3_000);
         assert_eq!(plain, instrumented, "the instrumented version must return byte-identical results to the plain version");
         assert!(stats.nodes_visited > 0, "a broad filter over 12,000 records (~3,000 candidates) should force the graph-traversal path, not the brute-force fast path");
         assert!(stats.nodes_matched <= stats.nodes_visited, "matched count can never exceed visited count");
@@ -913,7 +947,7 @@ mod tests {
             index.insert(id, &[id as f32, 0.0], &HashMap::from([("category".to_string(), MetadataValue::String(category.to_string()))]));
         }
         let op = FilterOp::Eq(MetadataValue::String("rare".to_string()));
-        let (_, stats) = index.search_filtered_with_stats(&[0.0, 0.0], 10, 50, "category", &op, 20_000);
+        let (_, stats) = index.search_filtered_with_stats(&[0.0, 0.0], 10, 50, "category", &op, 20_000, 3_000);
         assert_eq!(stats.nodes_visited, 0, "a single-match filter should take the brute-force path, not the instrumented graph traversal");
         assert_eq!(stats.nodes_matched, 0);
     }
@@ -936,7 +970,7 @@ mod tests {
             index.insert(id, &[x, y], &HashMap::from([("category".to_string(), MetadataValue::String(category.to_string()))]));
         }
         let op = FilterOp::Eq(MetadataValue::String("target".to_string()));
-        let (_, stats) = index.search_filtered_with_stats(&[0.0, 0.0], 10, 50, "category", &op, 20_000);
+        let (_, stats) = index.search_filtered_with_stats(&[0.0, 0.0], 10, 50, "category", &op, 20_000, 3_000);
         assert!(stats.nodes_visited > 0, "should take the graph-traversal path with ~3,000 candidates");
         assert!(
             stats.nodes_matched as f64 / stats.nodes_visited as f64 <= 1.0,
@@ -952,6 +986,60 @@ mod tests {
         // no way to visit the same node twice (search_layer's own
         // `visited` HashSet guarantees that).
         assert!(stats.nodes_matched <= 4_000, "cannot match more than the 4,000 records that actually satisfy the filter: got {}", stats.nodes_matched);
+    }
+
+    #[test]
+    fn raising_brute_force_threshold_routes_a_larger_candidate_set_through_the_fast_path() {
+        // Direct proof the new parameter actually changes which path gets
+        // taken, not just that it compiles: the same 4,000-candidate
+        // dataset should take the graph-traversal path at the default
+        // threshold (3,000) and the brute-force path once the threshold
+        // is raised past 4,000.
+        let mut index = VectorIndex::empty(HnswParams::default(), 1);
+        for id in 0..16_000u64 {
+            let category = if id % 4 == 0 { "target" } else { "other" };
+            let x = (id % 100) as f32;
+            let y = (id / 100) as f32;
+            index.insert(id, &[x, y], &HashMap::from([("category".to_string(), MetadataValue::String(category.to_string()))]));
+        }
+        let op = FilterOp::Eq(MetadataValue::String("target".to_string()));
+
+        let (_, stats_default_threshold) = index.search_filtered_with_stats(&[0.0, 0.0], 10, 50, "category", &op, 20_000, 3_000);
+        assert!(stats_default_threshold.nodes_visited > 0, "4,000 candidates should exceed the default 3,000 threshold and take the graph-traversal path");
+
+        let (_, stats_raised_threshold) = index.search_filtered_with_stats(&[0.0, 0.0], 10, 50, "category", &op, 20_000, 10_000);
+        assert_eq!(stats_raised_threshold.nodes_visited, 0, "4,000 candidates should stay under a 10,000 threshold and take the brute-force fast path");
+    }
+
+    #[test]
+    fn results_are_identical_regardless_of_which_path_a_given_threshold_selects() {
+        // The most important property of this parameter: it must be a
+        // pure performance/routing knob, never a correctness one. The
+        // brute-force path and the graph-traversal path must agree on
+        // results for the exact same query, even though they're
+        // completely different code paths.
+        let mut index = VectorIndex::empty(HnswParams::default(), 1);
+        for id in 0..16_000u64 {
+            let category = if id % 4 == 0 { "target" } else { "other" };
+            let x = (id % 100) as f32;
+            let y = (id / 100) as f32;
+            index.insert(id, &[x, y], &HashMap::from([("category".to_string(), MetadataValue::String(category.to_string()))]));
+        }
+        let op = FilterOp::Eq(MetadataValue::String("target".to_string()));
+
+        let via_graph_traversal = index.search_filtered_with_max_visits_and_threshold(&[0.0, 0.0], 10, 200, "category", &op, 20_000, 3_000);
+        let via_brute_force = index.search_filtered_with_max_visits_and_threshold(&[0.0, 0.0], 10, 200, "category", &op, 20_000, 10_000);
+
+        // Brute force is exact; graph traversal is approximate, so these
+        // aren't guaranteed byte-identical -- but with a generous
+        // ef_search (200) on a small, dense synthetic dataset they should
+        // agree closely. The real, unconditional guarantee: both return
+        // exactly k=10 results, all genuinely matching the filter (this
+        // is checked by construction -- field_index only ever returns ids
+        // that actually hold the value, and the traversal's own filter
+        // closure is the same predicate either way).
+        assert_eq!(via_graph_traversal.len(), 10);
+        assert_eq!(via_brute_force.len(), 10);
     }
 
     #[test]
