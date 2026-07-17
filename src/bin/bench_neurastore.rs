@@ -325,6 +325,74 @@ fn main() {
         println!("Filter tax is not yet beating the baseline -- investigate before claiming this as a win.");
     }
 
+    // --- Structural diagnostic: how much of the graph does a filtered
+    // query actually visit, and how much of that is wasted on
+    // non-matching nodes? Run as a SEPARATE pass, after the timed
+    // latency measurements above, specifically so the Cell-increment
+    // instrumentation overhead (small, but real) never touches the
+    // numbers the filter tax itself is computed from. See
+    // VectorIndex::search_filtered_with_stats's doc comment for the
+    // full reasoning -- added after ef_search, max_visits, and per-node
+    // hashing cost were each tested and either partially or fully ruled
+    // out as explanations for the filter tax at 1M scale.
+    println!("\n--- Structural diagnostic: graph-traversal visit/match stats ---");
+    let mut visited_samples = Vec::with_capacity(queries.len());
+    let mut hit_rate_samples = Vec::with_capacity(queries.len());
+    let mut brute_force_path_count = 0usize;
+    for (i, q) in queries.iter().enumerate() {
+        let category = &categories[i % categories.len()];
+        if let Some((_, stats)) = engine.search_knn_filtered_with_stats(
+            q,
+            k,
+            ef_search,
+            "category",
+            &FilterOp::Eq(MetadataValue::String(category.clone())),
+            max_visits,
+        ) {
+            if stats.nodes_visited == 0 {
+                brute_force_path_count += 1;
+                continue;
+            }
+            visited_samples.push(stats.nodes_visited as f64);
+            hit_rate_samples.push(stats.nodes_matched as f64 / stats.nodes_visited as f64);
+        }
+    }
+    if brute_force_path_count > 0 {
+        println!("{brute_force_path_count} of {} queries took the brute-force fast path (stats not meaningful there, excluded below)", queries.len());
+    }
+    if !visited_samples.is_empty() {
+        visited_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        hit_rate_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mean_visited: f64 = visited_samples.iter().sum::<f64>() / visited_samples.len() as f64;
+        let mean_hit_rate: f64 = hit_rate_samples.iter().sum::<f64>() / hit_rate_samples.len() as f64;
+        println!(
+            "Nodes visited per filtered query: n={} mean={:.0} p50={:.0} p95={:.0} max={:.0} (visit budget: {max_visits})",
+            visited_samples.len(),
+            mean_visited,
+            percentile(&visited_samples, 50.0),
+            percentile(&visited_samples, 95.0),
+            visited_samples.last().unwrap()
+        );
+        println!(
+            "Hit rate (nodes_matched / nodes_visited) per query: mean={:.1}% p50={:.1}% (base filter selectivity: ~25%)",
+            mean_hit_rate * 100.0,
+            percentile(&hit_rate_samples, 50.0) * 100.0
+        );
+        let at_budget_count = visited_samples.iter().filter(|&&v| v >= max_visits as f64 * 0.95).count();
+        println!(
+            "Queries visiting >=95% of the {max_visits} visit budget: {at_budget_count}/{} ({:.1}%)",
+            visited_samples.len(),
+            at_budget_count as f64 / visited_samples.len() as f64 * 100.0
+        );
+        if mean_hit_rate * 100.0 < 15.0 {
+            println!("Hit rate is well below the ~25% base selectivity -- real evidence the traversal is systematically wasting effort in non-matching regions of the graph (consistent with the Phase 2 cluster-stranding hypothesis).");
+        } else if mean_hit_rate * 100.0 > 20.0 {
+            println!("Hit rate is close to the ~25% base selectivity -- the traversal explores roughly randomly with respect to the filter; the tax looks like an inherent cost of needing more raw visits to accumulate enough matches, not a sign of the traversal getting lost.");
+        } else {
+            println!("Hit rate is somewhat below the ~25% base selectivity -- a real but partial effect, worth weighing alongside the visit-budget-saturation number above.");
+        }
+    }
+
     // Clean up the temp engine directory -- this binary is a benchmark
     // harness, not meant to leave durable state behind like a real run would.
     let _ = fs::remove_dir_all(&tmp_dir);

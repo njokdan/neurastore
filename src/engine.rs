@@ -348,6 +348,26 @@ impl Engine {
         })
     }
 
+    /// Same as `search_knn_filtered_with_max_visits`, additionally
+    /// reporting graph-traversal visit/match statistics -- see
+    /// `VectorIndex::search_filtered_with_stats`'s doc comment for the
+    /// hypothesis this exists to test.
+    pub fn search_knn_filtered_with_stats(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        field: &str,
+        op: &FilterOp,
+        max_visits: usize,
+    ) -> Option<(Vec<(RecordId, f32)>, crate::vector_index::FilteredSearchStats)> {
+        self.vector_index.as_ref().map(|idx| {
+            idx.read()
+                .expect("vector index lock poisoned")
+                .search_filtered_with_stats(query, k, ef_search, field, op, max_visits)
+        })
+    }
+
     fn maybe_flush(&mut self) -> Result<(), EngineError> {
         if self.memtable.len() >= self.flush_threshold {
             self.flush()?;

@@ -92,13 +92,15 @@ not yet re-run over HTTP at this scale) via
 | Recall@10 | 0.983 | 0.825 | 0.941 | 0.941 | 0.941 |
 | Filter tax | 1.13–1.32x | 12.62x | 6.59x | 7.22x (worse) | 6.68x (unchanged) |
 
-Three real hypotheses tested across four full 1M-scale runs.
-`ef_search` — confirmed real, substantial, partial fix. `max_visits`
-and per-node hashing cost — both cleanly ruled out with real evidence,
-including a standalone microbenchmark that measured a genuine ~2.1x
-per-call differential that nonetheless produced no measurable
-end-to-end effect. Every cheap, quickly-testable explanation is now
-exhausted; what remains needs real profiling instrumentation, not
-another constant tweak — documented as a known, honest, currently
-unresolved limitation. Full reasoning in `PORTFOLIO.md`.
+**Resolved**: profiling instrumentation measured the real cause at 1M
+scale, real SIFT data — hit rate (nodes matched / nodes visited during
+filtered traversal) landed at 25.0%, essentially exact against the
+~25% base filter selectivity, with zero of 10,000 queries anywhere near
+exhausting their visit budget. This decisively rules out a graph
+connectivity defect — the traversal genuinely needs ~4x the visits an
+equivalent unfiltered search would, because only 1-in-4 visited nodes
+match. That's a real, inherent, explainable cost of predicate-in-
+traversal filtering at moderate selectivity, not a bug, and it explains
+why the tax was small at 10K scale and large at 1M. Full reasoning in
+`PORTFOLIO.md`.
 

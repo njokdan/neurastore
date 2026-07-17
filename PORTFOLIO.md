@@ -173,24 +173,29 @@ which this fix cannot possibly affect — moved by almost the same
 proportion, a strong sign the change had no real end-to-end effect once
 folded into everything else the traversal does.
 
-**Where this honestly stands**: three real hypotheses tested across
-four full 1M-scale benchmark runs, each a genuine time cost on real
-hardware. `ef_search` — confirmed real, substantial, partial fix.
-`MAX_FILTERED_VISITS` and per-node hashing cost — both ruled out,
-cleanly, with real evidence. Every cheap, quickly-testable explanation
-is now exhausted. What's left is something structural in how filtered
-graph traversal behaves at 1M+ scale under broad selectivity — most
-plausibly connected to the already-documented Phase 2 property — and
-confirming that needs real profiling instrumentation, not another
-constant tweak. This is a deliberate, honest stopping point for the
-quick-diagnostic phase, not an abandoned thread: documented as a known,
-real, currently-unresolved limitation rather than pursued further
-without a more substantial, dedicated investment.
+**Resolved, with real profiling instrumentation, not another guess**:
+built diagnostic tooling that reports how many graph nodes a filtered
+query actually visits and what fraction of those pass the filter — the
+direct test of whether the traversal was getting systematically lost in
+non-matching regions of the graph (the cluster-stranding hypothesis) or
+not. The real 1M-scale result: hit rate landed at 25.0%, essentially
+exact against the ~25% base filter selectivity, and zero of 10,000
+queries came anywhere near exhausting their visit budget.
 
-This is left here, unresolved, on purpose — the same discipline as
-everywhere else in this document. A wrong number that gets corrected
-quietly is a worse pattern than a real problem reported honestly while
-still being investigated.
+**The cluster-stranding hypothesis is decisively ruled out** — the
+graph's connectivity is fine. The real, honest explanation: needing
+`ef` *matching* results when only 1-in-4 visited nodes actually match
+means the traversal structurally needs roughly 4x the visits an
+equivalent unfiltered search would need — a real, inherent cost of
+pushing a moderately-selective predicate into graph traversal, not a
+defect. It explains why the tax was small at 10K scale (a 4x multiplier
+on tiny absolute visit counts costs little) and large at 1M scale (the
+same multiplier on a much bigger base costs much more). Five full
+1M-scale benchmark runs, real machine time, a real answer at the end —
+not the one hoped for at the start, but a true one, and a genuinely
+better-justified case for a real metadata-partitioned filtering
+architecture (closer to why a second index type like IVF might actually
+be worth building) than existed before this investigation began.
 
 ## What's deliberately not built, and why
 

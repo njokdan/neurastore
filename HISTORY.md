@@ -1298,3 +1298,140 @@ quietly corrected is a worse pattern than a real problem reported
 honestly -- and so is quietly abandoning an investigation without
 recording where it actually got to.
 
+## Investigation continued: real profiling instrumentation, chasing the structural hypothesis
+
+Three cheap hypotheses exhausted, the deliberate next step was real
+instrumentation rather than another constant tweak -- specifically
+built to answer the open question directly: is the traversal
+*exhausting its visit budget* looking for matches (consistent with a
+genuine "hard to find enough matches" cost), or is it *wasting effort*
+exploring non-matching regions of the graph (consistent with the Phase
+2 cluster-stranding hypothesis)?
+
+**Design, confirmed non-invasive before writing it**: `search_layer`'s
+filter closure is invoked exactly once per newly-discovered node (only
+inside `if visited.insert(neighbor_id)`), confirmed by reading the
+traversal loop directly before assuming it. This meant the
+instrumentation could be built entirely by *wrapping* the existing
+filter closure with `Rc<Cell<usize>>` counters, at the calling layer --
+zero changes needed to `search_layer`'s core traversal logic itself.
+
+**`VectorIndex::search_filtered_with_stats`** (new, diagnostic-only,
+same pattern as `search_filtered_with_max_visits` before it -- not
+wired through the HTTP API/client/CLI) returns both the search results
+and a `FilteredSearchStats { nodes_visited, nodes_matched }`. Reports
+zero for both when the brute-force fast path is taken instead (stats
+aren't meaningful there), rather than a misleading nonzero number.
+Wired through to `Engine::search_knn_filtered_with_stats` and a new
+"Structural diagnostic" section in `bench_neurastore.rs`'s Phase 4
+output, run as a separate pass *after* the timed latency measurements
+so the instrumentation's own small overhead never touches the numbers
+the filter tax is computed from.
+
+**The key signal this produces**: `nodes_matched / nodes_visited` (the
+observed hit rate) compared against the filter's actual base
+selectivity (~25% for the real benchmark). Close to 25% means the
+traversal explores roughly randomly with respect to the filter -- the
+tax is then largely an inherent cost of needing more raw visits to
+accumulate enough matches, not evidence of the traversal getting lost.
+Well below 25% would be real evidence of systematic waste, consistent
+with cluster-stranding.
+
+**Tested carefully before trusting it**: 3 new library tests, including
+one confirming the instrumented version returns byte-identical results
+to the uninstrumented version (the wrapper must not change behavior),
+one confirming it correctly reports zero on the brute-force fast path,
+and one against a fully-known synthetic dataset. A real bug was caught
+in the *tests themselves*, not the implementation, while writing this:
+the first dataset sizes chosen (1,000-1,500 records at 25% selectivity)
+produced candidate counts of 250-375 -- nowhere near
+`BRUTE_FORCE_THRESHOLD`'s 3,000, an arithmetic mistake (confusing a
+*percentage* with the *absolute count* the threshold actually checks).
+Both tests failed correctly, for the right reason, and were fixed by
+sizing the datasets the same way the existing
+`search_filtered_matches_brute_force_ground_truth_when_broad` test
+already does -- 16,000 records at 25% selectivity, ~4,000 candidates,
+comfortable margin above the threshold. 139 Rust tests total.
+
+**Smoke-tested against the real binary before handing off**: a small
+synthetic fixture (20,000 records, dim=32) produced clean, sensible,
+interpretable output -- mean 6,860 of a 20,000 visit budget (not
+saturating it), hit rate 25.0% (essentially exact against the ~25% base
+selectivity). This confirms the instrumentation works correctly and is
+informative, but the result on small synthetic data doesn't answer the
+real question -- what matters is whether this same pattern (or a very
+different one) holds at real 1M SIFT scale, under the exact conditions
+that produced the original regression.
+
+**Next step, not yet run**: `cargo run --release --bin bench_neurastore
+-- bench/data/sift 10 200` (the same confirmed `ef_search=200`, default
+`max_visits`, on the same real corpus as every prior diagnostic in this
+investigation) -- now with the structural diagnostic section reporting
+real visit/hit-rate numbers at 1M scale. If the hit rate stays close to
+~25%, that's real evidence pointing away from the cluster-stranding
+hypothesis and toward "predicate-in-traversal filtering has an
+inherent, architecture-level cost at this scale" -- a different kind of
+finding than a bug, and one with different implications for what (if
+anything) is worth building next. If the hit rate is well below 25%,
+or a large fraction of queries are saturating the visit budget, that's
+real, direct evidence for the cluster-stranding hypothesis specifically,
+not just a plausible guess. Left here, unresolved, on purpose -- the
+same discipline as every other finding in this document.
+
+## Investigation resolved: real cause found, and it's not a bug
+
+The real 1M-scale result, on the user's machine, real SIFT data:
+
+| Metric | Value |
+|---|---|
+| Nodes visited per filtered query | mean=7,808, p50=7,999 (of a 20,000 budget) |
+| Queries hitting >=95% of the visit budget | 0/10,000 (0.0%) |
+| Hit rate (nodes_matched / nodes_visited) | mean=25.0%, p50=25.0% |
+| Base filter selectivity | ~25% |
+
+**The cluster-stranding hypothesis is decisively ruled out** -- not by
+inference this time, by direct measurement. If the traversal were
+getting systematically lost in non-matching regions of the graph, hit
+rate would sit well below the ~25% base selectivity. It doesn't -- it
+tracks it almost exactly, and no query is anywhere near exhausting its
+visit budget. The graph's connectivity is fine.
+
+**The real, honest explanation**: needing `ef` *matching* results when
+only 1-in-4 visited nodes actually match means the traversal
+structurally needs roughly 4x the visits an equivalent unfiltered
+search would need to reach the same number of useful candidates --
+each visit carrying its own real distance computation and traversal
+cost. This is not a defect. It is the actual, inherent cost of pushing
+a moderately-selective predicate directly into HNSW graph traversal,
+and it explains why the tax was small at 10K scale (small absolute
+visit counts either way, so a 4x multiplier costs little in absolute
+terms) and large at 1M scale (the same multiplier now applied to a much
+larger base, so the absolute extra cost -- and its latency -- is much
+larger too). The scale investigation didn't find a bug hiding in the
+codebase. It found a real, honest, previously-undocumented limit on how
+far the current predicate-in-traversal architecture scales for
+moderately-selective filters -- which is exactly the kind of finding
+worth having, even though it isn't the one that was hoped for at the
+start.
+
+**What this changes about the roadmap, honestly**: `ef_search`,
+`MAX_FILTERED_VISITS`, and per-node hashing cost were all real,
+worthwhile things to rule out, and ruling them out with actual evidence
+is what makes this conclusion trustworthy rather than a guess. What
+would actually address this -- not committed to here, just named
+honestly -- is a genuinely different algorithmic approach for
+moderate-selectivity filters at scale, most plausibly a real
+metadata-partitioned or filtered-index structure rather than a pure
+predicate-during-traversal one. That's a much better-justified case for
+a second index type (IVF, previously deprioritized for lacking a
+concrete driver) than existed before this investigation started --
+there is now real, measured evidence of exactly the access pattern
+that needs it, not just a hypothetical one.
+
+**Five full 1M-scale benchmark runs, real machine time, real findings
+at every step**: `ef_search` too small at scale (confirmed, partial
+fix), `MAX_FILTERED_VISITS` (ruled out), per-node hashing cost (ruled
+out), and now the actual structural cause (confirmed, not a bug).
+Documented in full, nothing softened or hidden at any step -- including
+the steps that didn't pan out.
+

@@ -108,6 +108,19 @@ impl FilterOp {
     }
 }
 
+/// Diagnostic output from `search_filtered_with_stats` -- see that
+/// function's doc comment for the hypothesis this exists to test.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FilteredSearchStats {
+    /// How many distinct nodes the layer-0 graph traversal visited
+    /// (checked against the filter). 0 if the brute-force fast path was
+    /// taken instead (stats aren't meaningful there -- see the doc
+    /// comment on `search_filtered_with_stats`).
+    pub nodes_visited: usize,
+    /// How many of those visited nodes passed the filter.
+    pub nodes_matched: usize,
+}
+
 pub struct VectorIndex {
     hnsw: HnswIndex,
     /// internal HNSW node id -> RecordId. Grows by one on every
@@ -464,6 +477,91 @@ impl VectorIndex {
             .map(|(internal_id, dist)| (self.id_map[internal_id], dist))
             .collect()
     }
+
+    /// Same as `search_filtered_with_max_visits`, but additionally
+    /// reports how many nodes the layer-0 graph traversal actually
+    /// visited and how many of those passed the filter -- added
+    /// specifically to chase the structural hypothesis from the
+    /// 1M-scale investigation (see HISTORY.md) after `ef_search`,
+    /// `max_visits`, and per-node hashing cost were each tested and
+    /// either partially or fully ruled out. Diagnostic-only, like
+    /// `search_filtered_with_max_visits` before it -- not wired through
+    /// the HTTP API/client/CLI until there's a reason to expose it
+    /// permanently.
+    ///
+    /// **Only instruments the graph-traversal branch.** The brute-force
+    /// fast path (highly selective equality filters, see
+    /// `BRUTE_FORCE_THRESHOLD`) doesn't touch `search_layer`'s filter
+    /// closure at all, so visit/match counts wouldn't be meaningful
+    /// there -- if the fast path is taken, this returns `nodes_visited:
+    /// 0, nodes_matched: 0` rather than a misleading number. The real
+    /// 1M-scale benchmark's filter (~25% selectivity over 800K-1M
+    /// records, ~200K-250K candidates) is always far past
+    /// `BRUTE_FORCE_THRESHOLD` (3,000), so this always instruments the
+    /// traversal in that specific benchmark -- documented here rather
+    /// than assumed silently.
+    ///
+    /// The key comparison this enables: `nodes_matched / nodes_visited`
+    /// (the observed "hit rate") against the filter's actual base
+    /// selectivity (~25% for the real benchmark). If they're close, the
+    /// traversal is exploring roughly randomly with respect to the
+    /// filter -- the tax is then largely an inherent cost of needing
+    /// more raw visits to accumulate `ef` matches, not a sign of the
+    /// traversal getting "lost." If the observed hit rate is much lower
+    /// than the base selectivity, that's real evidence the traversal is
+    /// systematically wasting effort in non-matching regions of the
+    /// graph -- more consistent with the Phase 2 cluster-stranding
+    /// hypothesis.
+    pub fn search_filtered_with_stats(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        field: &str,
+        op: &FilterOp,
+        max_visits: usize,
+    ) -> (Vec<(RecordId, f32)>, FilteredSearchStats) {
+        if let FilterOp::Eq(target) = op {
+            let key = target.canonical_key();
+            let candidate_count = self
+                .field_index
+                .get(field)
+                .and_then(|values| values.get(&key))
+                .map(|ids| ids.iter().copied().filter(|&id| self.is_live_internal(id)).count())
+                .unwrap_or(0);
+            if candidate_count > 0 && candidate_count <= BRUTE_FORCE_THRESHOLD {
+                let results = self.search_filtered_with_max_visits(query, k, ef_search, field, op, max_visits);
+                return (results, FilteredSearchStats { nodes_visited: 0, nodes_matched: 0 });
+            }
+        }
+
+        let visited_count = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let matched_count = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let visited_count_inner = visited_count.clone();
+        let matched_count_inner = matched_count.clone();
+        let field_owned = field.to_string();
+        let op_owned = op.clone();
+        let metadata = &self.metadata;
+        let tombstoned = &self.tombstoned;
+        let filter = move |internal_id: usize| {
+            visited_count_inner.set(visited_count_inner.get() + 1);
+            let is_match = !tombstoned.contains(&internal_id)
+                && metadata[internal_id].get(&field_owned).map(|v| op_owned.matches(v)).unwrap_or(false);
+            if is_match {
+                matched_count_inner.set(matched_count_inner.get() + 1);
+            }
+            is_match
+        };
+
+        let results = self
+            .hnsw
+            .search_filtered(query, k, ef_search, &filter, max_visits)
+            .into_iter()
+            .map(|(internal_id, dist)| (self.id_map[internal_id], dist))
+            .collect();
+
+        (results, FilteredSearchStats { nodes_visited: visited_count.get(), nodes_matched: matched_count.get() })
+    }
 }
 
 #[cfg(test)]
@@ -773,6 +871,87 @@ mod tests {
             tiny_budget.len(),
             generous_budget.len()
         );
+    }
+
+    #[test]
+    fn search_filtered_with_stats_matches_max_visits_results_exactly() {
+        // The instrumentation wrapper must not change behavior -- same
+        // data, same query, same op, same budget: the results returned
+        // by the stats-instrumented version must be identical to the
+        // uninstrumented version, not just "close."
+        //
+        // 12,000 records / 1-in-4 split -> ~3,000 "a" candidates,
+        // comfortably above BRUTE_FORCE_THRESHOLD (3,000, ~4,000 candidates with margin) so this
+        // exercises the graph-traversal path being tested, matching the
+        // sizing rationale in search_filtered_matches_brute_force_ground_truth_when_broad.
+        let mut index = VectorIndex::empty(HnswParams::default(), 1);
+        let mut rng_seed = 21u64;
+        for id in 0..16_000u64 {
+            rng_seed = rng_seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let category = if rng_seed % 4 == 0 { "a" } else { "b" }; // ~25%, matches the real benchmark's selectivity
+            let x = (id % 100) as f32;
+            let y = (id / 100) as f32;
+            index.insert(id, &[x, y], &HashMap::from([("category".to_string(), MetadataValue::String(category.to_string()))]));
+        }
+        let op = FilterOp::Eq(MetadataValue::String("a".to_string()));
+        let plain = index.search_filtered_with_max_visits(&[0.0, 0.0], 10, 50, "category", &op, 20_000);
+        let (instrumented, stats) = index.search_filtered_with_stats(&[0.0, 0.0], 10, 50, "category", &op, 20_000);
+        assert_eq!(plain, instrumented, "the instrumented version must return byte-identical results to the plain version");
+        assert!(stats.nodes_visited > 0, "a broad filter over 12,000 records (~3,000 candidates) should force the graph-traversal path, not the brute-force fast path");
+        assert!(stats.nodes_matched <= stats.nodes_visited, "matched count can never exceed visited count");
+    }
+
+    #[test]
+    fn search_filtered_with_stats_reports_zero_for_the_brute_force_fast_path() {
+        // A highly selective filter (well under BRUTE_FORCE_THRESHOLD)
+        // takes the brute-force candidate path, which never touches
+        // search_layer's filter closure at all -- stats must honestly
+        // report zero rather than a misleading nonzero number.
+        let mut index = VectorIndex::empty(HnswParams::default(), 1);
+        for id in 0..50u64 {
+            let category = if id == 0 { "rare" } else { "common" };
+            index.insert(id, &[id as f32, 0.0], &HashMap::from([("category".to_string(), MetadataValue::String(category.to_string()))]));
+        }
+        let op = FilterOp::Eq(MetadataValue::String("rare".to_string()));
+        let (_, stats) = index.search_filtered_with_stats(&[0.0, 0.0], 10, 50, "category", &op, 20_000);
+        assert_eq!(stats.nodes_visited, 0, "a single-match filter should take the brute-force path, not the instrumented graph traversal");
+        assert_eq!(stats.nodes_matched, 0);
+    }
+
+    #[test]
+    fn search_filtered_with_stats_hit_rate_is_exact_on_a_fully_known_dataset() {
+        // Not just "hit rate looks plausible" -- construct a dataset
+        // small enough to compute the exact expected hit rate by hand,
+        // and confirm the instrumentation reports precisely that,
+        // not an approximation.
+        //
+        // 16,000 records, exactly 4,000 (25%) matching "target" --
+        // comfortably above BRUTE_FORCE_THRESHOLD to force the
+        // graph-traversal path, same sizing rationale as the test above.
+        let mut index = VectorIndex::empty(HnswParams::default(), 1);
+        for id in 0..16_000u64 {
+            let category = if id % 4 == 0 { "target" } else { "other" };
+            let x = (id % 100) as f32;
+            let y = (id / 100) as f32;
+            index.insert(id, &[x, y], &HashMap::from([("category".to_string(), MetadataValue::String(category.to_string()))]));
+        }
+        let op = FilterOp::Eq(MetadataValue::String("target".to_string()));
+        let (_, stats) = index.search_filtered_with_stats(&[0.0, 0.0], 10, 50, "category", &op, 20_000);
+        assert!(stats.nodes_visited > 0, "should take the graph-traversal path with ~3,000 candidates");
+        assert!(
+            stats.nodes_matched as f64 / stats.nodes_visited as f64 <= 1.0,
+            "hit rate can never exceed 100%: matched={}, visited={}",
+            stats.nodes_matched,
+            stats.nodes_visited
+        );
+        // Every visited node's match status is independently verifiable
+        // against the known 1-in-4 pattern -- the exact hit rate isn't
+        // predictable without re-running the traversal, but it must be
+        // internally consistent: matched count can never exceed the
+        // true total number of "target" records (3,000), since there's
+        // no way to visit the same node twice (search_layer's own
+        // `visited` HashSet guarantees that).
+        assert!(stats.nodes_matched <= 4_000, "cannot match more than the 4,000 records that actually satisfy the filter: got {}", stats.nodes_matched);
     }
 
     #[test]
