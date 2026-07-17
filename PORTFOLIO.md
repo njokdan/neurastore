@@ -240,3 +240,4 @@ help.
 | How do I run it? | [`README.md`](./README.md)'s quickstart (Docker, `cargo run`) |
 | How do I use it from Python? | [`client/python/README.md`](./client/python/README.md) |
 | How do I deploy it with TLS? | `HISTORY.md`'s Phase 7 TLS section, [`deploy/Caddyfile`](./deploy/Caddyfile) |
+| What's the plan for fixing the filter-tax scaling limit? | [`PARTITIONING_DESIGN.md`](./PARTITIONING_DESIGN.md) |

@@ -1526,3 +1526,15 @@ disciplined path a real architectural investment should take: prove the
 cheap fixes don't work before spending weeks on the expensive one, so
 the expensive one is backed by evidence instead of intuition.
 
+**Design worked out, not yet implemented**: see
+[`PARTITIONING_DESIGN.md`](./PARTITIONING_DESIGN.md) for the full,
+scoped design of a metadata-partitioned filtering structure -- what's
+in scope for a first pass (one explicit partition key, equality filters
+only, a hard cardinality cap), what's deliberately deferred (range
+queries on the partition key, multiple simultaneous keys, high-
+cardinality fields), and the real, stated cost (partitioned records
+live in two graphs, not one -- roughly 2x memory for those records
+specifically). Not wired through the HTTP API until the core mechanism
+is built and proven at real 1M scale, same reasoning as every
+diagnostic-only function added throughout this investigation.
+
